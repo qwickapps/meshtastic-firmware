@@ -62,6 +62,33 @@ void PhoneAPI::handleStartConfig()
 {
     // Must be before setting state (because state is how we know !connected)
     if (!isConnected()) {
+        MeshService::APIState clientState = MeshService::STATE_DISCONNECTED;
+        switch (api_type) {
+        case TYPE_BLE:
+            clientState = MeshService::STATE_BLE;
+            break;
+        case TYPE_WIFI:
+            clientState = MeshService::STATE_WIFI;
+            break;
+        case TYPE_SERIAL:
+            clientState = MeshService::STATE_SERIAL;
+            break;
+        case TYPE_PACKET:
+            clientState = MeshService::STATE_PACKET;
+            break;
+        case TYPE_HTTP:
+            clientState = MeshService::STATE_HTTP;
+            break;
+        case TYPE_ETH:
+            clientState = MeshService::STATE_ETH;
+            break;
+        default:
+            break;
+        }
+
+        if (!service->registerPhoneClient(this, clientState)) {
+            LOG_ERROR("Failed to register phone client for fanout");
+        }
         onConnectionChanged(true);
         observe(&service->fromNumChanged);
 #ifdef FSCom
@@ -112,18 +139,6 @@ void PhoneAPI::handleStartConfig()
 void PhoneAPI::close()
 {
     LOG_DEBUG("PhoneAPI::close()");
-    if (service->api_state == service->STATE_BLE && api_type == TYPE_BLE)
-        service->api_state = service->STATE_DISCONNECTED;
-    else if (service->api_state == service->STATE_WIFI && api_type == TYPE_WIFI)
-        service->api_state = service->STATE_DISCONNECTED;
-    else if (service->api_state == service->STATE_SERIAL && api_type == TYPE_SERIAL)
-        service->api_state = service->STATE_DISCONNECTED;
-    else if (service->api_state == service->STATE_PACKET && api_type == TYPE_PACKET)
-        service->api_state = service->STATE_DISCONNECTED;
-    else if (service->api_state == service->STATE_HTTP && api_type == TYPE_HTTP)
-        service->api_state = service->STATE_DISCONNECTED;
-    else if (service->api_state == service->STATE_ETH && api_type == TYPE_ETH)
-        service->api_state = service->STATE_DISCONNECTED;
 
     if (state != STATE_SEND_NOTHING) {
         state = STATE_SEND_NOTHING;
@@ -136,6 +151,7 @@ void PhoneAPI::close()
         releaseQueueStatusPhonePacket();
         releaseMqttClientProxyPhonePacket();
         releaseClientNotification();
+        service->unregisterPhoneClient(this);
         onConnectionChanged(false);
         fromRadioScratch = {};
         toRadioScratch = {};
@@ -153,6 +169,8 @@ void PhoneAPI::close()
         config_state = 0;
         pauseBluetoothLogging = false;
         heartbeatReceived = false;
+    } else {
+        service->unregisterPhoneClient(this);
     }
 }
 
@@ -626,19 +644,6 @@ void PhoneAPI::sendConfigComplete()
     fromRadioScratch.config_complete_id = config_nonce;
     config_nonce = 0;
     state = STATE_SEND_PACKETS;
-    if (api_type == TYPE_BLE) {
-        service->api_state = service->STATE_BLE;
-    } else if (api_type == TYPE_WIFI) {
-        service->api_state = service->STATE_WIFI;
-    } else if (api_type == TYPE_SERIAL) {
-        service->api_state = service->STATE_SERIAL;
-    } else if (api_type == TYPE_PACKET) {
-        service->api_state = service->STATE_PACKET;
-    } else if (api_type == TYPE_HTTP) {
-        service->api_state = service->STATE_HTTP;
-    } else if (api_type == TYPE_ETH) {
-        service->api_state = service->STATE_ETH;
-    }
 
     // Allow subclasses to know we've entered steady-state so they can lower power consumption
     onConfigComplete();
@@ -649,7 +654,7 @@ void PhoneAPI::sendConfigComplete()
 void PhoneAPI::releasePhonePacket()
 {
     if (packetForPhone) {
-        service->releaseToPool(packetForPhone); // we just copied the bytes, so don't need this buffer anymore
+        service->releaseToPoolForPhone(this, packetForPhone); // we just copied the bytes, so don't need this buffer anymore
         packetForPhone = NULL;
     }
 }
@@ -657,7 +662,7 @@ void PhoneAPI::releasePhonePacket()
 void PhoneAPI::releaseQueueStatusPhonePacket()
 {
     if (queueStatusPacketForPhone) {
-        service->releaseQueueStatusToPool(queueStatusPacketForPhone);
+        service->releaseQueueStatusToPoolForPhone(this, queueStatusPacketForPhone);
         queueStatusPacketForPhone = NULL;
     }
 }
@@ -698,7 +703,7 @@ void PhoneAPI::prefetchNodeInfos()
 void PhoneAPI::releaseMqttClientProxyPhonePacket()
 {
     if (mqttClientProxyMessageForPhone) {
-        service->releaseMqttClientProxyMessageToPool(mqttClientProxyMessageForPhone);
+        service->releaseMqttClientProxyMessageToPoolForPhone(this, mqttClientProxyMessageForPhone);
         mqttClientProxyMessageForPhone = NULL;
     }
 }
@@ -706,7 +711,7 @@ void PhoneAPI::releaseMqttClientProxyPhonePacket()
 void PhoneAPI::releaseClientNotification()
 {
     if (clientNotification) {
-        service->releaseClientNotificationToPool(clientNotification);
+        service->releaseClientNotificationToPoolForPhone(this, clientNotification);
         clientNotification = NULL;
     }
 }
@@ -743,11 +748,11 @@ bool PhoneAPI::available()
         return true;
     case STATE_SEND_PACKETS: {
         if (!queueStatusPacketForPhone)
-            queueStatusPacketForPhone = service->getQueueStatusForPhone();
+            queueStatusPacketForPhone = service->getQueueStatusForPhone(this);
         if (!mqttClientProxyMessageForPhone)
-            mqttClientProxyMessageForPhone = service->getMqttClientProxyMessageForPhone();
+            mqttClientProxyMessageForPhone = service->getMqttClientProxyMessageForPhone(this);
         if (!clientNotification)
-            clientNotification = service->getClientNotificationForPhone();
+            clientNotification = service->getClientNotificationForPhone(this);
         bool hasPacket = !!queueStatusPacketForPhone || !!mqttClientProxyMessageForPhone || !!clientNotification;
         if (hasPacket)
             return true;
@@ -770,7 +775,7 @@ bool PhoneAPI::available()
 #endif
 
         if (!packetForPhone)
-            packetForPhone = service->getForPhone();
+            packetForPhone = service->getForPhone(this);
         hasPacket = !!packetForPhone;
         return hasPacket;
     }
