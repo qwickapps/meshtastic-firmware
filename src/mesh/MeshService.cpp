@@ -12,6 +12,7 @@
 #include "PowerFSM.h"
 #include "RTC.h"
 #include "TypeConversions.h"
+#include "Throttle.h"
 #include "concurrency/LockGuard.h"
 #include "graphics/draw/MessageRenderer.h"
 #include "main.h"
@@ -1068,7 +1069,7 @@ bool MeshService::isToPhoneQueueEmpty()
             continue;
 
         if (slot.packetInflight || !slot.packetQueue.isEmpty()) {
-            if (slot.lastDrainMsec != 0 && millis() - slot.lastDrainMsec > 30000)
+            if (slot.lastDrainMsec != 0 && !Throttle::isWithinTimespanMs(slot.lastDrainMsec, 30000))
                 continue;
             return false;
         }

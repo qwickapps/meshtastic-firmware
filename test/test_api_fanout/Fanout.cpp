@@ -123,7 +123,7 @@ void test_disconnect_cleans_pending_and_inflight_without_breaking_other_clients(
     meshService.releaseToPoolForPhone(secondClient, secondPacket2);
 }
 
-void test_no_active_clients_does_not_buffer_packets(void)
+void test_no_active_clients_replays_packet_to_first_registered_client(void)
 {
     MeshService meshService;
     meshService.sendToPhone(allocDecodedPacket(301, 0x3001));
@@ -131,7 +131,10 @@ void test_no_active_clients_does_not_buffer_packets(void)
     DummyClientToken token;
     PhoneAPI *client = asClient(token);
     TEST_ASSERT_TRUE(meshService.registerPhoneClient(client, MeshService::STATE_SERIAL));
-    TEST_ASSERT_NULL(meshService.getForPhone(client));
+    meshtastic_MeshPacket *packet = meshService.getForPhone(client);
+    TEST_ASSERT_NOT_NULL(packet);
+    TEST_ASSERT_EQUAL_UINT32(301, packet->id);
+    meshService.releaseToPoolForPhone(client, packet);
 }
 
 void test_api_state_mask_refcount_for_same_state_clients(void)
@@ -243,7 +246,7 @@ void setup()
     RUN_TEST(test_fanout_packet_delivered_to_all_active_clients_once);
     RUN_TEST(test_slow_client_drop_oldest_fast_client_continuous_delivery);
     RUN_TEST(test_disconnect_cleans_pending_and_inflight_without_breaking_other_clients);
-    RUN_TEST(test_no_active_clients_does_not_buffer_packets);
+    RUN_TEST(test_no_active_clients_replays_packet_to_first_registered_client);
     RUN_TEST(test_api_state_mask_refcount_for_same_state_clients);
     RUN_TEST(test_fanout_pool_capacity_accounts_for_inflight_all_clients);
     RUN_TEST(test_register_overflow_does_not_change_state_mask_or_existing_delivery);
