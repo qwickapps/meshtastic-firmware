@@ -180,6 +180,9 @@ class PhoneAPI
     APIType api_type = TYPE_NONE;
 
   private:
+    static bool fillConfig(meshtastic_FromRadio &out, uint8_t which);
+    static bool fillModuleConfig(meshtastic_FromRadio &out, uint8_t which);
+
     void releasePhonePacket();
 
     void releaseQueueStatusPhonePacket();
