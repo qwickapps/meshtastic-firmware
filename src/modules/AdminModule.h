@@ -2,6 +2,7 @@
 #ifdef ESP_PLATFORM
 #include <esp_ota_ops.h>
 #endif
+#include "MeshService.h"
 #include "ProtobufModule.h"
 #include <sys/types.h>
 #if HAS_WIFI
@@ -37,6 +38,9 @@ class AdminModule : public ProtobufModule<meshtastic_AdminMessage>, public Obser
 
   private:
     bool hasOpenEditTransaction = false;
+
+    /// Settings changed inside an open edit transaction, pushed to the other phone clients on commit
+    MeshService::ConfigSyncSet pendingConfigSync;
 
     uint8_t session_passkey[8] = {0};
     uint session_time = 0;

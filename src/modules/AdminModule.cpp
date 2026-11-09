@@ -137,6 +137,10 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
             return handled;
         }
     }
+
+    // Settings sections this request changed, re-sent to the other phone clients once committed (config coherence)
+    MeshService::ConfigSyncSet configSync;
+
     switch (r->which_payload_variant) {
 
     /**
@@ -195,17 +199,22 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
             }
         }
         handleSetOwner(r->set_owner);
+        configSync.owner = true;
         break;
 
     case meshtastic_AdminMessage_set_config_tag:
         LOG_DEBUG("Client set config");
         handleSetConfig(r->set_config);
+        if (r->set_config.which_payload_variant != meshtastic_Config_device_ui_tag)
+            configSync.config |= 1u << r->set_config.which_payload_variant;
         break;
 
     case meshtastic_AdminMessage_set_module_config_tag:
         LOG_DEBUG("Client set module config");
         if (!handleSetModuleConfig(r->set_module_config)) {
             myReply = allocErrorResponse(meshtastic_Routing_Error_BAD_REQUEST, &mp);
+        } else {
+            configSync.moduleConfig |= 1u << r->set_module_config.which_payload_variant;
         }
         break;
 
@@ -213,8 +222,10 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
         LOG_DEBUG("Client set channel %d", r->set_channel.index);
         if (r->set_channel.index < 0 || r->set_channel.index >= (int)MAX_NUM_CHANNELS)
             myReply = allocErrorResponse(meshtastic_Routing_Error_BAD_REQUEST, &mp);
-        else
+        else {
             handleSetChannel(r->set_channel);
+            configSync.channels |= 1u << r->set_channel.index;
+        }
         break;
     case meshtastic_AdminMessage_set_ham_mode_tag:
         LOG_DEBUG("Client set ham mode");
@@ -336,6 +347,8 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
         disableBluetooth();
         LOG_INFO("Commit transaction for edited settings");
         hasOpenEditTransaction = false;
+        configSync.merge(pendingConfigSync); // changes made inside the transaction are pushed now
+        pendingConfigSync.clear();
         saveChanges(SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS | SEGMENT_NODEDATABASE);
         break;
     }
@@ -534,6 +547,15 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
             LOG_DEBUG("Module API did not handle admin message %d", r->which_payload_variant);
         }
         break;
+    }
+
+    if (configSync.any()) {
+        if (hasOpenEditTransaction) {
+            pendingConfigSync.merge(configSync); // not committed yet
+        } else {
+            // A local request came from one of our phone clients: it already knows, skip it. Remote admin: tell everyone.
+            service->pushConfigToOtherPhoneClients(configSync, mp.from == 0 ? mp.id : 0);
+        }
     }
 
     // Allow any observers (e.g. the UI) to handle/respond
