@@ -496,6 +496,8 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
             fromRadioScratch.which_payload_variant = meshtastic_FromRadio_clientNotification_tag;
             fromRadioScratch.clientNotification = *clientNotification;
             releaseClientNotification();
+        } else if (fillPendingConfigSync()) {
+            LOG_DEBUG("FromRadio=config sync, variant=%d", fromRadioScratch.which_payload_variant);
         } else if (packetForPhone) {
             printPacket("phone downloaded packet", packetForPhone);
 
@@ -666,6 +668,48 @@ bool PhoneAPI::fillModuleConfig(meshtastic_FromRadio &out, uint8_t which)
     return true;
 }
 
+/**
+ * Config coherence: if another client changed settings, fill fromRadioScratch with the next changed section (read now, so it
+ * is always the current value). Returns true if fromRadioScratch holds a packet to send.
+ */
+bool PhoneAPI::fillPendingConfigSync()
+{
+    MeshService::ConfigSyncItem item;
+    while (service->takePendingConfigForPhone(this, item)) {
+        switch (item.kind) {
+        case MeshService::ConfigSyncItem::OWNER: {
+            auto us = nodeDB->getMeshNode(nodeDB->getNodeNum());
+            if (!us)
+                continue;
+            auto info = TypeConversions::ConvertToNodeInfo(us);
+            info.has_hops_away = false;
+            info.is_favorite = true;
+            fromRadioScratch.which_payload_variant = meshtastic_FromRadio_node_info_tag;
+            fromRadioScratch.node_info = info;
+            return true;
+        }
+        case MeshService::ConfigSyncItem::CHANNEL:
+            if (item.index >= MAX_NUM_CHANNELS)
+                continue;
+            fromRadioScratch.which_payload_variant = meshtastic_FromRadio_channel_tag;
+            fromRadioScratch.channel = channels.getByIndex(item.index);
+            return true;
+        case MeshService::ConfigSyncItem::CONFIG:
+            if (fillConfig(fromRadioScratch, item.index))
+                return true;
+            break;
+        case MeshService::ConfigSyncItem::MODULE_CONFIG:
+            if (fillModuleConfig(fromRadioScratch, item.index))
+                return true;
+            break;
+        default:
+            break;
+        }
+        memset(&fromRadioScratch, 0, sizeof(fromRadioScratch)); // section we do not send: try the next one
+    }
+    return false;
+}
+
 void PhoneAPI::sendConfigComplete()
 {
     LOG_INFO("Config Send Complete millis=%u", millis());
@@ -786,6 +830,10 @@ bool PhoneAPI::available()
         if (hasPacket)
             return true;
 
+        // Settings another client changed (config coherence)
+        if (service->hasPendingConfigForPhone(this))
+            return true;
+
 #ifdef FSCom
         if (xmodemPacketForPhone.control == meshtastic_XModem_Control_NUL)
             xmodemPacketForPhone = xModem.getForPhone();
@@ -899,7 +947,7 @@ bool PhoneAPI::handleToRadioPacket(meshtastic_MeshPacket &p)
     }
 
     lastPortNumToRadio[p.decoded.portnum] = millis();
-    service->handleToRadio(p);
+    service->handleToRadio(p, this);
     return true;
 }
 

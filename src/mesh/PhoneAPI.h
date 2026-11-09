@@ -182,6 +182,7 @@ class PhoneAPI
   private:
     static bool fillConfig(meshtastic_FromRadio &out, uint8_t which);
     static bool fillModuleConfig(meshtastic_FromRadio &out, uint8_t which);
+    bool fillPendingConfigSync();
 
     void releasePhonePacket();
 
