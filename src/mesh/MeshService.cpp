@@ -233,6 +233,13 @@ void MeshService::clearClientSlotLocked(PhoneClientSlot &slot)
     slot.client = nullptr;
 }
 
+bool MeshService::isSlotStaleLocked(PhoneClientSlot &slot)
+{
+    if (!slot.packetInflight && slot.packetQueue.isEmpty())
+        return false; // nothing pending, nothing to be stale about
+    return slot.lastDrainMsec != 0 && !Throttle::isWithinTimespanMs(slot.lastDrainMsec, kStaleClientDrainMs);
+}
+
 void MeshService::updateApiStateLocked(APIState preferred)
 {
     api_state_mask = 0;
@@ -292,9 +299,14 @@ bool MeshService::enqueuePacketFanoutLocked(meshtastic_MeshPacket *p)
             }
         }
 
+        // A client that was idle has not failed to drain anything yet: start its drain clock now so it is not
+        // considered stale the moment a packet arrives after a quiet period.
+        const bool wasIdle = !slot.packetInflight && slot.packetQueue.isEmpty();
         if (slot.packetQueue.enqueue(entry, 0)) {
             entry->refcount++;
             delivered = true;
+            if (wasIdle)
+                slot.lastDrainMsec = millis();
         } else {
             LOG_WARN("Failed to enqueue packet fanout for client slot %d", i);
         }
@@ -1069,7 +1081,7 @@ bool MeshService::isToPhoneQueueEmpty()
             continue;
 
         if (slot.packetInflight || !slot.packetQueue.isEmpty()) {
-            if (slot.lastDrainMsec != 0 && !Throttle::isWithinTimespanMs(slot.lastDrainMsec, 30000))
+            if (isSlotStaleLocked(slot))
                 continue;
             return false;
         }

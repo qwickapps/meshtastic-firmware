@@ -159,6 +159,10 @@ class MeshService
     int findClientSlotByPtrLocked(const PhoneAPI *client);
     int findFreeClientSlotLocked() const;
     void clearClientSlotLocked(PhoneClientSlot &slot);
+    /// A client with pending packets that has not drained one for kStaleClientDrainMs is considered stale: it no longer
+    /// holds the node awake and no longer throttles shared producers (e.g. store-and-forward replay).
+    static constexpr uint32_t kStaleClientDrainMs = 30 * 1000;
+    bool isSlotStaleLocked(PhoneClientSlot &slot);
     void replayDetachedPacketBacklogLocked(PhoneClientSlot &slot);
     void updateApiStateLocked(APIState preferred = STATE_DISCONNECTED);
 
