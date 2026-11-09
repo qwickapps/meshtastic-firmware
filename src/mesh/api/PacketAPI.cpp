@@ -17,26 +17,16 @@ PacketAPI *PacketAPI::create(PacketServer *_server)
 }
 
 PacketAPI::PacketAPI(PacketServer *_server)
-    : concurrency::OSThread("PacketAPI"), isConnected(false), programmingMode(false), server(_server)
+    : concurrency::OSThread("PacketAPI"), isConnected(false), server(_server)
 {
     api_type = TYPE_PACKET;
 }
 
 int32_t PacketAPI::runOnce()
 {
-    bool success = false;
-#ifndef ARCH_PORTDUINO
-    if (config.bluetooth.enabled) {
-        if (!programmingMode) {
-            // in programmingMode we don't send any packets to the client except this one notify
-            programmingMode = true;
-            success = notifyProgrammingMode();
-        }
-    } else
-#endif
-    {
-        success = sendPacket();
-    }
+    // The device-ui is a full PhoneAPI client: it keeps receiving every packet while Bluetooth is enabled
+    // (BLE phone clients get their own copy through the per-client fan-out queues).
+    bool success = sendPacket();
     success |= receivePacket();
     return success ? 10 : 50;
 }
@@ -62,7 +52,7 @@ bool PacketAPI::receivePacket(void)
             meshtastic_MeshPacket *mp = &mr->packet;
             mp->transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_API;
             printPacket("PACKET FROM QUEUE", mp);
-            service->handleToRadio(*mp);
+            service->handleToRadio(*mp, this);
             break;
         }
         case meshtastic_ToRadio_want_config_id_tag: {
@@ -105,18 +95,6 @@ bool PacketAPI::sendPacket(void)
         }
     }
     return false;
-}
-
-bool PacketAPI::notifyProgrammingMode(void)
-{
-    // tell the client we are in programming mode by sending only the bluetooth config state
-    LOG_INFO("force client into programmingMode");
-    memset(&fromRadioScratch, 0, sizeof(fromRadioScratch));
-    fromRadioScratch.id = nodeDB->getNodeNum();
-    fromRadioScratch.which_payload_variant = meshtastic_FromRadio_config_tag;
-    fromRadioScratch.config.which_payload_variant = meshtastic_Config_bluetooth_tag;
-    fromRadioScratch.config.payload_variant.bluetooth = config.bluetooth;
-    return server->sendPacket(DataPacket<meshtastic_FromRadio>(0, fromRadioScratch));
 }
 
 /**

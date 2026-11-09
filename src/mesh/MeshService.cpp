@@ -17,6 +17,7 @@
 #include "main.h"
 #include "mesh-pb-constants.h"
 #include "meshUtils.h"
+#include "modules/AdminModule.h"
 #include "modules/NodeInfoModule.h"
 #include "modules/PositionModule.h"
 #include "modules/RoutingModule.h"
@@ -207,6 +208,8 @@ void MeshService::clearClientSlotLocked(PhoneClientSlot &slot)
         slot.clientNotificationInflight = nullptr;
     }
 
+    slot.pendingConfigSync.clear();
+    slot.connectionId = 0;
     slot.active = false;
     slot.state = STATE_DISCONNECTED;
     slot.client = nullptr;
@@ -447,6 +450,9 @@ bool MeshService::registerPhoneClient(PhoneAPI *client, APIState state)
     slot.client = client;
     slot.state = state;
     slot.active = true;
+    if (++lastConnectionId == 0) // 0 means "not registered"
+        ++lastConnectionId;
+    slot.connectionId = lastConnectionId;
 
     apiStateCounts[state]++;
     updateApiStateLocked(state);
@@ -473,6 +479,128 @@ void MeshService::unregisterPhoneClient(PhoneAPI *client)
 
     clearClientSlotLocked(slot);
     updateApiStateLocked();
+}
+
+void MeshService::noteAdminRequestOrigin(PacketId id, const PhoneAPI *client)
+{
+    if (!id || !client)
+        return;
+
+    concurrency::LockGuard guard(&phoneClientsLock);
+    adminOrigins[adminOriginNext].id = id;
+    adminOrigins[adminOriginNext].client = client;
+    adminOriginNext = (adminOriginNext + 1) % kAdminOriginSlots;
+}
+
+const PhoneAPI *MeshService::findAdminRequestOriginLocked(PacketId id) const
+{
+    if (!id)
+        return nullptr;
+    for (int i = 0; i < kAdminOriginSlots; i++) {
+        if (adminOrigins[i].id == id)
+            return adminOrigins[i].client;
+    }
+    return nullptr;
+}
+
+const PhoneAPI *MeshService::getAdminRequestOrigin(PacketId id)
+{
+    concurrency::LockGuard guard(&phoneClientsLock);
+    return findAdminRequestOriginLocked(id);
+}
+
+uint32_t MeshService::getPhoneConnectionId(const PhoneAPI *client)
+{
+    if (!client)
+        return 0;
+
+    concurrency::LockGuard guard(&phoneClientsLock);
+    int slotIndex = findClientSlotByPtrLocked(client);
+    return (slotIndex >= 0 && phoneClients[slotIndex].active) ? phoneClients[slotIndex].connectionId : 0;
+}
+
+int MeshService::pushConfigToOtherPhoneClients(const ConfigSyncSet &changed, PacketId requestId)
+{
+    if (!changed.any())
+        return 0;
+
+    int marked = 0;
+    {
+        concurrency::LockGuard guard(&phoneClientsLock);
+
+        const PhoneAPI *requester = findAdminRequestOriginLocked(requestId);
+
+        for (int i = 0; i < MAX_PHONE_API_CLIENTS; i++) {
+            auto &slot = phoneClients[i];
+            if (!slot.active || slot.client == requester)
+                continue;
+            slot.pendingConfigSync.merge(changed);
+            marked++;
+        }
+    }
+
+    if (marked) {
+        LOG_INFO("Config sync: re-send changed settings to %d other client(s)", marked);
+        fromNum++; // wake the clients (BLE notify) so they fetch the sections
+    }
+    return marked;
+}
+
+bool MeshService::hasPendingConfigForPhone(PhoneAPI *client)
+{
+    concurrency::LockGuard guard(&phoneClientsLock);
+
+    int slotIndex = findClientSlotByPtrLocked(client);
+    return slotIndex >= 0 && phoneClients[slotIndex].active && phoneClients[slotIndex].pendingConfigSync.any();
+}
+
+static_assert(MAX_NUM_CHANNELS <= 32, "ConfigSyncSet::channels is a 32 bit mask");
+static_assert(_meshtastic_AdminMessage_ConfigType_MAX < 32 && _meshtastic_AdminMessage_ModuleConfigType_MAX < 32,
+              "ConfigSyncSet config masks are 32 bit");
+
+/// Pop the lowest set bit of mask into index; false if mask is empty
+static bool popLowestBit(uint32_t &mask, uint8_t &index)
+{
+    for (uint8_t i = 0; i < 32; i++) {
+        if (mask & (1u << i)) {
+            mask &= ~(1u << i);
+            index = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool MeshService::takePendingConfigForPhone(PhoneAPI *client, ConfigSyncItem &item)
+{
+    concurrency::LockGuard guard(&phoneClientsLock);
+
+    int slotIndex = findClientSlotByPtrLocked(client);
+    if (slotIndex < 0 || !phoneClients[slotIndex].active)
+        return false;
+
+    // Same order as the initial config download: owner (our nodeinfo), channels, config, module config
+    ConfigSyncSet &pending = phoneClients[slotIndex].pendingConfigSync;
+    if (pending.owner) {
+        pending.owner = false;
+        item.kind = ConfigSyncItem::OWNER;
+        item.index = 0;
+        return true;
+    }
+    if (popLowestBit(pending.channels, item.index)) {
+        item.kind = ConfigSyncItem::CHANNEL;
+        return true;
+    }
+    if (popLowestBit(pending.config, item.index)) {
+        item.kind = ConfigSyncItem::CONFIG;
+        return true;
+    }
+    if (popLowestBit(pending.moduleConfig, item.index)) {
+        item.kind = ConfigSyncItem::MODULE_CONFIG;
+        return true;
+    }
+    item.kind = ConfigSyncItem::NONE;
+    return false;
 }
 
 meshtastic_MeshPacket *MeshService::getForPhone(PhoneAPI *client)
@@ -679,6 +807,10 @@ int MeshService::handleFromRadio(const meshtastic_MeshPacket *mp)
 /// Do idle processing (mostly processing messages which have been queued from the radio)
 void MeshService::loop()
 {
+#if !MESHTASTIC_EXCLUDE_ADMIN
+    if (adminModule)
+        adminModule->checkEditTransactionOwner(); // abort a settings transaction whose phone client went away
+#endif
     if (lastQueueStatus.free == 0) { // check if there is now free space in TX queue
         meshtastic_QueueStatus qs = router->getQueueStatus();
         if (qs.free != lastQueueStatus.free)
@@ -756,9 +888,9 @@ NodeNum MeshService::getNodenumFromRequestId(uint32_t request_id)
 /**
  *  Given a ToRadio buffer parse it and properly handle it (setup radio, owner or send packet into the mesh)
  * Called by PhoneAPI.handleToRadio.  Note: p is a scratch buffer, this function is allowed to write to it but it can not keep a
- * reference
+ * reference. origin is the phone client that sent it (nullptr if unknown).
  */
-void MeshService::handleToRadio(meshtastic_MeshPacket &p)
+void MeshService::handleToRadio(meshtastic_MeshPacket &p, const PhoneAPI *origin)
 {
 #if defined(ARCH_PORTDUINO)
     if (SimRadio::instance && p.decoded.portnum == meshtastic_PortNum_SIMULATOR_APP) {
@@ -773,6 +905,11 @@ void MeshService::handleToRadio(meshtastic_MeshPacket &p)
 
     if (p.id == 0)
         p.id = generatePacketId(); // If the phone didn't supply one, then pick one
+
+    // Remember which client sent a local admin request, so the config-sync push after it commits skips the requester
+    if (origin && p.which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
+        p.decoded.portnum == meshtastic_PortNum_ADMIN_APP && isToUs(&p))
+        noteAdminRequestOrigin(p.id, origin);
 
     p.rx_time = getValidTime(RTCQualityFromNet); // Record the time the packet arrived from the phone
 
