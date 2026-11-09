@@ -32,7 +32,7 @@ extern Allocator<meshtastic_ClientNotification> &clientNotificationPool;
 class PhoneAPI;
 
 #ifndef MAX_PHONE_API_CLIENTS
-#define MAX_PHONE_API_CLIENTS 3
+#define MAX_PHONE_API_CLIENTS 5
 #endif
 
 /**
@@ -87,6 +87,7 @@ class MeshService
         PhoneAPI *client = nullptr;
         APIState state = STATE_DISCONNECTED;
         bool active = false;
+        uint32_t lastDrainMsec = 0;
 
 #if defined(ARCH_PORTDUINO)
         PointerQueue<PacketFanoutEntry> packetQueue;
@@ -133,6 +134,12 @@ class MeshService
 
     PhoneClientSlot phoneClients[MAX_PHONE_API_CLIENTS];
 
+#if defined(ARCH_PORTDUINO)
+    PointerQueue<meshtastic_MeshPacket> detachedPacketBacklog;
+#else
+    StaticPointerQueue<meshtastic_MeshPacket, MAX_RX_TOPHONE> detachedPacketBacklog;
+#endif
+
     /// Protects fanout client registry and all per-client fanout queues
     concurrency::Lock phoneClientsLock;
 
@@ -152,6 +159,7 @@ class MeshService
     int findClientSlotByPtrLocked(const PhoneAPI *client);
     int findFreeClientSlotLocked() const;
     void clearClientSlotLocked(PhoneClientSlot &slot);
+    void replayDetachedPacketBacklogLocked(PhoneClientSlot &slot);
     void updateApiStateLocked(APIState preferred = STATE_DISCONNECTED);
 
     void releasePacketFanoutEntryLocked(PacketFanoutEntry *entry);

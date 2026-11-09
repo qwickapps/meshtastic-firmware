@@ -235,6 +235,7 @@ int32_t WebServerThread::runOnce()
     }
 
     handleWebResponse();
+    checkHttpApiConnection();
 
     if (requestRestart && (millis() / 1000) > requestRestart) {
         ESP.restart();

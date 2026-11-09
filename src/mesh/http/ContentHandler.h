@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 void registerHandlers(HTTPServer *insecureServer, HTTPSServer *secureServer);
+void checkHttpApiConnection();
 
 // Declare some handler functions for the various URLs on the server
 void handleAPIv1FromRadio(HTTPRequest *req, HTTPResponse *res);

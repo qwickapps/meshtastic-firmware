@@ -6,12 +6,9 @@ namespace concurrency
 {
 
 #ifdef HAS_FREE_RTOS
-Lock::Lock() : handle(xSemaphoreCreateBinary())
+Lock::Lock() : handle(xSemaphoreCreateMutex())
 {
     assert(handle);
-    if (xSemaphoreGive(handle) == false) {
-        abort();
-    }
 }
 
 Lock::~Lock()

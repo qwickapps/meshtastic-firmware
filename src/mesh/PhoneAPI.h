@@ -66,6 +66,8 @@ class PhoneAPI
     /// We temporarily keep the packet here between the call to available and getFromRadio.  We will free it after the phone
     /// downloads it
     meshtastic_MeshPacket *packetForPhone = NULL;
+    enum class PacketForPhoneOrigin : uint8_t { None, Fanout, StoreForward };
+    PacketForPhoneOrigin packetForPhoneOrigin = PacketForPhoneOrigin::None;
 
     // file transfer packets destined for phone. Push it to the queue then free it.
     meshtastic_XModem xmodemPacketForPhone = meshtastic_XModem_init_zero;
@@ -137,6 +139,9 @@ class PhoneAPI
 
     bool isConnected() { return state != STATE_SEND_NOTHING; }
     bool isSendingPackets() { return state == STATE_SEND_PACKETS; }
+
+    /// Allow transports with their own service loop to expire a stale client.
+    bool checkConnection() { return checkConnectionTimeout(); }
 
   protected:
     /// Our fromradio packet while it is being assembled

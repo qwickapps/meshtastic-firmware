@@ -662,8 +662,13 @@ void PhoneAPI::sendConfigComplete()
 void PhoneAPI::releasePhonePacket()
 {
     if (packetForPhone) {
-        service->releaseToPoolForPhone(this, packetForPhone); // we just copied the bytes, so don't need this buffer anymore
+        if (packetForPhoneOrigin == PacketForPhoneOrigin::Fanout) {
+            service->releaseToPoolForPhone(this, packetForPhone);
+        } else if (packetForPhoneOrigin == PacketForPhoneOrigin::StoreForward) {
+            service->releaseToPool(packetForPhone);
+        }
         packetForPhone = NULL;
+        packetForPhoneOrigin = PacketForPhoneOrigin::None;
     }
 }
 
@@ -774,16 +779,10 @@ bool PhoneAPI::available()
         }
 #endif
 
-#ifdef ARCH_ESP32
-#if !MESHTASTIC_EXCLUDE_STOREFORWARD
-        // Check if StoreForward has packets stored for us.
-        if (!packetForPhone && storeForwardModule)
-            packetForPhone = storeForwardModule->getForPhone();
-#endif
-#endif
-
-        if (!packetForPhone)
+        if (!packetForPhone) {
             packetForPhone = service->getForPhone(this);
+            packetForPhoneOrigin = packetForPhone ? PacketForPhoneOrigin::Fanout : PacketForPhoneOrigin::None;
+        }
         hasPacket = !!packetForPhone;
         return hasPacket;
     }
@@ -797,6 +796,10 @@ bool PhoneAPI::available()
 void PhoneAPI::sendNotification(meshtastic_LogRecord_Level level, uint32_t replyId, const char *message)
 {
     meshtastic_ClientNotification *cn = clientNotificationPool.allocZeroed();
+    if (!cn) {
+        LOG_WARN("Unable to allocate client notification");
+        return;
+    }
     cn->has_reply_id = true;
     cn->reply_id = replyId;
     cn->level = meshtastic_LogRecord_Level_WARNING;
