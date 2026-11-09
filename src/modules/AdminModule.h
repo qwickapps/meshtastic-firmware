@@ -29,6 +29,12 @@ class AdminModule : public ProtobufModule<meshtastic_AdminMessage>, public Obser
      */
     AdminModule();
 
+    /**
+     * Called from the main loop: abort an open edit transaction whose phone client disconnected without committing.
+     * Without this the transaction stays open forever and keeps deferring that client's settings.
+     */
+    void checkEditTransactionOwner();
+
   protected:
     /** Called to handle a particular incoming message
 
@@ -39,8 +45,23 @@ class AdminModule : public ProtobufModule<meshtastic_AdminMessage>, public Obser
   private:
     bool hasOpenEditTransaction = false;
 
+    /**
+     * Who opened the edit transaction (begin_edit_settings): the sending node (0 = local) and, for a local request, the
+     * phone client and its connection id. Only the owner's changes are deferred to the commit; the other clients (e.g.
+     * the MUI while a BLE app edits) apply their changes immediately.
+     */
+    NodeNum editTransactionFrom = 0;
+    const PhoneAPI *editTransactionClient = nullptr;
+    uint32_t editTransactionConnectionId = 0;
+
+    /// A change was deferred inside the open edit transaction (it is only in RAM until the commit)
+    bool editTransactionDirty = false;
+
     /// Settings changed inside an open edit transaction, pushed to the other phone clients on commit
     MeshService::ConfigSyncSet pendingConfigSync;
+
+    bool isEditTransactionOwner(NodeNum from, const PhoneAPI *client) const;
+    void closeEditTransaction();
 
     uint8_t session_passkey[8] = {0};
     uint session_time = 0;

@@ -17,6 +17,7 @@
 #include "main.h"
 #include "mesh-pb-constants.h"
 #include "meshUtils.h"
+#include "modules/AdminModule.h"
 #include "modules/NodeInfoModule.h"
 #include "modules/PositionModule.h"
 #include "modules/RoutingModule.h"
@@ -806,6 +807,10 @@ int MeshService::handleFromRadio(const meshtastic_MeshPacket *mp)
 /// Do idle processing (mostly processing messages which have been queued from the radio)
 void MeshService::loop()
 {
+#if !MESHTASTIC_EXCLUDE_ADMIN
+    if (adminModule)
+        adminModule->checkEditTransactionOwner(); // abort a settings transaction whose phone client went away
+#endif
     if (lastQueueStatus.free == 0) { // check if there is now free space in TX queue
         meshtastic_QueueStatus qs = router->getQueueStatus();
         if (qs.free != lastQueueStatus.free)

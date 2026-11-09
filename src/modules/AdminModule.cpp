@@ -141,6 +141,20 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
     // Settings sections this request changed, re-sent to the other phone clients once committed (config coherence)
     MeshService::ConfigSyncSet configSync;
 
+    // An open edit transaction belongs to the client that began it. A change from any other client (e.g. the MUI while a
+    // BLE app has begin_edit_settings open) is not deferred into it: it is saved and pushed now. Note that saving writes
+    // the whole in-RAM section, which includes the owner's uncommitted edits of that section so far.
+    checkEditTransactionOwner();
+    const PhoneAPI *requestClient = (mp.from == 0) ? service->getAdminRequestOrigin(mp.id) : nullptr;
+    bool suspendEditTransaction = hasOpenEditTransaction &&
+                                  r->which_payload_variant != meshtastic_AdminMessage_begin_edit_settings_tag &&
+                                  r->which_payload_variant != meshtastic_AdminMessage_commit_edit_settings_tag &&
+                                  !isEditTransactionOwner(mp.from, requestClient);
+    if (suspendEditTransaction) {
+        LOG_INFO("Admin request from a client other than the edit transaction owner: apply it now");
+        hasOpenEditTransaction = false;
+    }
+
     switch (r->which_payload_variant) {
 
     /**
@@ -340,13 +354,19 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
     }
     case meshtastic_AdminMessage_begin_edit_settings_tag: {
         LOG_INFO("Begin transaction for editing settings");
+        if (hasOpenEditTransaction && !isEditTransactionOwner(mp.from, requestClient))
+            LOG_WARN("Edit transaction of another client still open, the new begin takes it over");
         hasOpenEditTransaction = true;
+        editTransactionFrom = mp.from;
+        // track the owner's connection only if it is a registered phone client (else it cannot be seen disconnecting)
+        editTransactionConnectionId = service->getPhoneConnectionId(requestClient);
+        editTransactionClient = editTransactionConnectionId ? requestClient : nullptr;
         break;
     }
     case meshtastic_AdminMessage_commit_edit_settings_tag: {
         disableBluetooth();
         LOG_INFO("Commit transaction for edited settings");
-        hasOpenEditTransaction = false;
+        closeEditTransaction();
         configSync.merge(pendingConfigSync); // changes made inside the transaction are pushed now
         pendingConfigSync.clear();
         saveChanges(SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS | SEGMENT_NODEDATABASE);
@@ -557,6 +577,9 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
             service->pushConfigToOtherPhoneClients(configSync, mp.from == 0 ? mp.id : 0);
         }
     }
+
+    if (suspendEditTransaction)
+        hasOpenEditTransaction = true; // the owner's transaction stays open
 
     // Allow any observers (e.g. the UI) to handle/respond
     AdminMessageHandleResult observerResult = AdminMessageHandleResult::NOT_HANDLED;
@@ -1383,6 +1406,40 @@ void AdminModule::reboot(int32_t seconds)
     rebootAtMsec = (seconds < 0) ? 0 : (millis() + seconds * 1000);
 }
 
+bool AdminModule::isEditTransactionOwner(NodeNum from, const PhoneAPI *client) const
+{
+    // a local owner that is not a tracked phone client (editTransactionClient == nullptr) matches any local request
+    return from == editTransactionFrom && (from != 0 || !editTransactionClient || client == editTransactionClient);
+}
+
+void AdminModule::closeEditTransaction()
+{
+    hasOpenEditTransaction = false;
+    editTransactionFrom = 0;
+    editTransactionClient = nullptr;
+    editTransactionConnectionId = 0;
+    editTransactionDirty = false;
+}
+
+void AdminModule::checkEditTransactionOwner()
+{
+    if (!hasOpenEditTransaction || !editTransactionClient)
+        return;
+    if (service->getPhoneConnectionId(editTransactionClient) == editTransactionConnectionId)
+        return; // owner still connected (a reconnect of the same PhoneAPI object gets a new connection id)
+
+    LOG_WARN("Phone client disconnected with an open edit transaction, abort it");
+    bool discardEdits = editTransactionDirty;
+    closeEditTransaction();
+    pendingConfigSync.clear();
+    if (discardEdits) {
+        // The uncommitted edits exist only in RAM and some are applied already (e.g. keys, owner). Rebooting reloads the
+        // saved settings from flash and drops them; nothing is saved before the reboot.
+        LOG_WARN("Discard the uncommitted settings: reboot to reload the saved settings");
+        reboot(DEFAULT_REBOOT_SECONDS);
+    }
+}
+
 void AdminModule::saveChanges(int saveWhat, bool shouldReboot)
 {
     if (!hasOpenEditTransaction) {
@@ -1390,6 +1447,7 @@ void AdminModule::saveChanges(int saveWhat, bool shouldReboot)
         service->reloadConfig(saveWhat); // Calls saveToDisk among other things
     } else {
         LOG_INFO("Delay save of changes to disk until the open transaction is committed");
+        editTransactionDirty = true;
     }
     if (shouldReboot && !hasOpenEditTransaction) {
         reboot(DEFAULT_REBOOT_SECONDS);
