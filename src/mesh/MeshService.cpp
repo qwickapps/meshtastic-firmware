@@ -208,6 +208,7 @@ void MeshService::clearClientSlotLocked(PhoneClientSlot &slot)
     }
 
     slot.pendingConfigSync.clear();
+    slot.connectionId = 0;
     slot.active = false;
     slot.state = STATE_DISCONNECTED;
     slot.client = nullptr;
@@ -448,6 +449,9 @@ bool MeshService::registerPhoneClient(PhoneAPI *client, APIState state)
     slot.client = client;
     slot.state = state;
     slot.active = true;
+    if (++lastConnectionId == 0) // 0 means "not registered"
+        ++lastConnectionId;
+    slot.connectionId = lastConnectionId;
 
     apiStateCounts[state]++;
     updateApiStateLocked(state);
@@ -487,6 +491,33 @@ void MeshService::noteAdminRequestOrigin(PacketId id, const PhoneAPI *client)
     adminOriginNext = (adminOriginNext + 1) % kAdminOriginSlots;
 }
 
+const PhoneAPI *MeshService::findAdminRequestOriginLocked(PacketId id) const
+{
+    if (!id)
+        return nullptr;
+    for (int i = 0; i < kAdminOriginSlots; i++) {
+        if (adminOrigins[i].id == id)
+            return adminOrigins[i].client;
+    }
+    return nullptr;
+}
+
+const PhoneAPI *MeshService::getAdminRequestOrigin(PacketId id)
+{
+    concurrency::LockGuard guard(&phoneClientsLock);
+    return findAdminRequestOriginLocked(id);
+}
+
+uint32_t MeshService::getPhoneConnectionId(const PhoneAPI *client)
+{
+    if (!client)
+        return 0;
+
+    concurrency::LockGuard guard(&phoneClientsLock);
+    int slotIndex = findClientSlotByPtrLocked(client);
+    return (slotIndex >= 0 && phoneClients[slotIndex].active) ? phoneClients[slotIndex].connectionId : 0;
+}
+
 int MeshService::pushConfigToOtherPhoneClients(const ConfigSyncSet &changed, PacketId requestId)
 {
     if (!changed.any())
@@ -496,15 +527,7 @@ int MeshService::pushConfigToOtherPhoneClients(const ConfigSyncSet &changed, Pac
     {
         concurrency::LockGuard guard(&phoneClientsLock);
 
-        const PhoneAPI *requester = nullptr;
-        if (requestId) {
-            for (int i = 0; i < kAdminOriginSlots; i++) {
-                if (adminOrigins[i].id == requestId) {
-                    requester = adminOrigins[i].client;
-                    break;
-                }
-            }
-        }
+        const PhoneAPI *requester = findAdminRequestOriginLocked(requestId);
 
         for (int i = 0; i < MAX_PHONE_API_CLIENTS; i++) {
             auto &slot = phoneClients[i];

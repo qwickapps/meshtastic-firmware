@@ -119,6 +119,8 @@ class MeshService
         PhoneAPI *client = nullptr;
         APIState state = STATE_DISCONNECTED;
         bool active = false;
+        /// Connection id, unique per registration (PhoneAPI objects such as the BLE one are reused across connections)
+        uint32_t connectionId = 0;
 
 #if defined(ARCH_PORTDUINO)
         PointerQueue<PacketFanoutEntry> packetQueue;
@@ -182,6 +184,11 @@ class MeshService
     AdminRequestOrigin adminOrigins[kAdminOriginSlots];
     uint8_t adminOriginNext = 0;
 
+    /// Last PhoneClientSlot::connectionId handed out (protected by phoneClientsLock)
+    uint32_t lastConnectionId = 0;
+
+    const PhoneAPI *findAdminRequestOriginLocked(PacketId id) const;
+
     // This holds the last QueueStatus send
     meshtastic_QueueStatus lastQueueStatus;
 
@@ -238,6 +245,15 @@ class MeshService
 
     /// Remember that phone client `client` sent the local admin request with packet id `id`
     void noteAdminRequestOrigin(PacketId id, const PhoneAPI *client);
+
+    /// The phone client that sent local admin request `id` (see noteAdminRequestOrigin), nullptr if unknown
+    const PhoneAPI *getAdminRequestOrigin(PacketId id);
+
+    /**
+     * Id of `client`'s current connection, 0 if it is not registered. A new connection of the same PhoneAPI object gets a
+     * new id, so a stored (client, id) pair tells whether that connection is still up.
+     */
+    uint32_t getPhoneConnectionId(const PhoneAPI *client);
 
     /**
      * Config coherence: mark `changed` as pending on every registered phone client except the one that sent admin request
