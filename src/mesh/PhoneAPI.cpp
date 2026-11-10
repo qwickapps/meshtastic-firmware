@@ -662,6 +662,7 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
     if (fromRadioScratch.which_payload_variant != 0) {
         // Encapsulate as a FromRadio packet
         size_t numbytes = pb_encode_to_bytes(buf, meshtastic_FromRadio_size, &meshtastic_FromRadio_msg, &fromRadioScratch);
+        service->notePhoneClientRead(this); // a client still downloading its config is reading, not stale
 
         // VERY IMPORTANT to not print debug messages while writing to fromRadioScratch - because we use that same buffer
         // for logging (when we are encapsulating with protobufs)

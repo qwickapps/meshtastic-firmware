@@ -53,16 +53,16 @@ MeshService *service;
 /*
  * Payload pool sizing for the per-client fanout.
  *
- * A payload is allocated once and shared (refcounted) by every client queue it is fanned out to, so the pools are sized by
- * the number of *distinct* payloads that can be alive, not by clients x queue depth. For QueueStatus, MqttClientProxy and
- * ClientNotification every active client receives every payload in order and a full queue drops its oldest entry, so each
- * client's queue holds a suffix of the same global sequence (at most QUEUE_DEPTH distinct payloads shared by all clients)
- * plus at most one older in-flight payload per client. One more covers a producer that has allocated but not yet enqueued.
+ * A payload is allocated once and shared (refcounted) by every client queue it is fanned out to. For QueueStatus,
+ * MqttClientProxy and ClientNotification every active client receives every payload and a full queue drops its oldest
+ * entry, so the queues hold suffixes of one global sequence:
  *
  *   distinct live payloads <= QUEUE_DEPTH + MAX_PHONE_API_CLIENTS + 1
  *
- * MeshPackets come from packetPool and are not affected. Producers must still null-check: a payload that cannot be
- * allocated is dropped, never dereferenced.
+ * MeshPackets (packetPool) do not follow this: a full packet queue evicts its oldest non-text entry first, so client
+ * queues diverge and up to MAX_PHONE_API_CLIENTS * (MAX_RX_TOPHONE + 1) packets can be alive. A client that stops
+ * reading is suspended after kStaleClientDrainMs and its queue released, which limits that to clients that keep reading.
+ * Producers must null-check: a payload that cannot be allocated is dropped, never dereferenced.
  */
 #define FANOUT_PAYLOAD_POOL_SIZE(queueDepth) ((queueDepth) + MAX_PHONE_API_CLIENTS + 1)
 
@@ -82,6 +82,26 @@ Allocator<meshtastic_ClientNotification> &clientNotificationPool = staticClientN
 Allocator<meshtastic_QueueStatus> &queueStatusPool = staticQueueStatusPool;
 
 #include "Router.h"
+
+namespace
+{
+/// Remove and return the oldest entry matching pred, keeping the order of the others; nullptr if none matches.
+template <class Queue, class Pred> auto removeOldestMatching(Queue &queue, Pred pred) -> decltype(queue.dequeuePtr(0))
+{
+    decltype(queue.dequeuePtr(0)) found = nullptr;
+    const int used = queue.numUsed();
+    for (int i = 0; i < used; i++) {
+        auto entry = queue.dequeuePtr(0);
+        if (!entry)
+            break;
+        if (!found && pred(entry))
+            found = entry;
+        else
+            queue.enqueue(entry, 0);
+    }
+    return found;
+}
+} // namespace
 
 MeshService::MeshService()
 #if defined(ARCH_PORTDUINO)
@@ -244,6 +264,7 @@ void MeshService::clearClientSlotLocked(PhoneClientSlot &slot)
     }
 
     slot.active = false;
+    slot.suspended = false;
     slot.lastDrainMsec = 0;
     slot.state = STATE_DISCONNECTED;
     slot.client = nullptr;
@@ -254,6 +275,39 @@ bool MeshService::isSlotStaleLocked(PhoneClientSlot &slot)
     if (!slot.packetInflight && slot.packetQueue.isEmpty())
         return false; // nothing pending, nothing to be stale about
     return slot.lastDrainMsec != 0 && !Throttle::isWithinTimespanMs(slot.lastDrainMsec, kStaleClientDrainMs);
+}
+
+void MeshService::suspendIfStaleLocked(PhoneClientSlot &slot, int slotIndex)
+{
+    if (slot.suspended || !isSlotStaleLocked(slot))
+        return;
+    // The in-flight packet stays: the client may still hold a pointer to it.
+    int dropped = 0;
+    while (auto entry = slot.packetQueue.dequeuePtr(0)) {
+        releasePacketFanoutEntryLocked(entry);
+        dropped++;
+    }
+    slot.suspended = true;
+    LOG_WARN("Phone client slot %d read nothing for %us, drop its %d queued packets until it reads again", slotIndex,
+             (unsigned)(kStaleClientDrainMs / 1000), dropped);
+}
+
+void MeshService::resumeLocked(PhoneClientSlot &slot)
+{
+    slot.suspended = false;
+    slot.lastDrainMsec = millis();
+}
+
+bool MeshService::makeRoomInPacketQueueLocked(PhoneClientSlot &slot, bool newIsText)
+{
+    auto victim = removeOldestMatching(slot.packetQueue,
+                                       [](PacketFanoutEntry *e) { return !e->payload || !isTextPayload(e->payload); });
+    if (!victim && newIsText)
+        victim = slot.packetQueue.dequeuePtr(0); // only text queued: the oldest text makes room for the new one
+    if (!victim)
+        return false;
+    releasePacketFanoutEntryLocked(victim);
+    return true;
 }
 
 void MeshService::updateApiStateLocked(APIState preferred)
@@ -298,19 +352,22 @@ bool MeshService::enqueuePacketFanoutLocked(meshtastic_MeshPacket *p)
 
     entry->payload = p;
 
+    const bool newIsText = isTextPayload(p);
     bool delivered = false;
     for (int i = 0; i < MAX_PHONE_API_CLIENTS; i++) {
         auto &slot = phoneClients[i];
         if (!slot.active)
             continue;
 
+        suspendIfStaleLocked(slot, i);
+        if (slot.suspended)
+            continue;
+
         if (slot.packetQueue.numFree() == 0) {
-            if (isTextPayload(p)) {
-                LOG_WARN("Packet fanout queue full for client slot %d, discard oldest text packet", i);
-                if (auto oldEntry = slot.packetQueue.dequeuePtr(0))
-                    releasePacketFanoutEntryLocked(oldEntry);
+            if (makeRoomInPacketQueueLocked(slot, newIsText)) {
+                LOG_WARN("Packet fanout queue full for client slot %d, discard oldest non-text (or text) packet", i);
             } else {
-                LOG_WARN("Packet fanout queue full for client slot %d, drop new non-text packet", i);
+                LOG_WARN("Packet fanout queue full of text for client slot %d, drop new non-text packet", i);
                 continue;
             }
         }
@@ -545,10 +602,23 @@ meshtastic_MeshPacket *MeshService::getForPhone(PhoneAPI *client)
     if (!slot.active)
         return nullptr;
 
+    if (slot.suspended)
+        resumeLocked(slot);
+
     if (!slot.packetInflight)
         slot.packetInflight = slot.packetQueue.dequeuePtr(0);
 
     return slot.packetInflight ? slot.packetInflight->payload : nullptr;
+}
+
+void MeshService::notePhoneClientRead(PhoneAPI *client)
+{
+    concurrency::LockGuard guard(&phoneClientsLock);
+
+    int slotIndex = findClientSlotByPtrLocked(client);
+    if (slotIndex < 0 || !phoneClients[slotIndex].active)
+        return;
+    resumeLocked(phoneClients[slotIndex]);
 }
 
 meshtastic_QueueStatus *MeshService::getQueueStatusForPhone(PhoneAPI *client)
@@ -994,7 +1064,7 @@ bool MeshService::canAcceptStoreForwardPacket()
     bool anyLiveClient = false;
     for (int i = 0; i < MAX_PHONE_API_CLIENTS; i++) {
         auto &slot = phoneClients[i];
-        if (!slot.active || isSlotStaleLocked(slot))
+        if (!slot.active || slot.suspended || isSlotStaleLocked(slot))
             continue;
         if (slot.packetQueue.numFree() == 0)
             return false;
@@ -1010,15 +1080,17 @@ void MeshService::enqueueToPhoneClients(meshtastic_MeshPacket *p)
         concurrency::LockGuard guard(&phoneClientsLock);
         if (api_state_mask == 0) {
             if (detachedPacketBacklog.numFree() == 0) {
-                if (isTextPayload(p)) {
-                    LOG_WARN("Detached phone backlog full, discard oldest text packet");
-                    if (auto old = detachedPacketBacklog.dequeuePtr(0))
-                        releaseToPool(old);
-                } else {
-                    LOG_WARN("Detached phone backlog full, drop new non-text packet");
+                auto old = removeOldestMatching(detachedPacketBacklog,
+                                                [](meshtastic_MeshPacket *q) { return !isTextPayload(q); });
+                if (!old && isTextPayload(p))
+                    old = detachedPacketBacklog.dequeuePtr(0);
+                if (!old) {
+                    LOG_WARN("Detached phone backlog full of text, drop new non-text packet");
                     releaseToPool(p);
                     return;
                 }
+                LOG_WARN("Detached phone backlog full, discard oldest non-text (or text) packet");
+                releaseToPool(old);
             }
             if (!detachedPacketBacklog.enqueue(p, 0)) {
                 LOG_WARN("Failed to enqueue packet in detached phone backlog");

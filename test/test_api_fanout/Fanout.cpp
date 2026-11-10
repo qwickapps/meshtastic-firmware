@@ -3,13 +3,34 @@
 #include "NodeDB.h"
 #include "PhoneAPI.h"
 #include "Router.h"
-#include "mesh/CryptoEngine.h"
 #include "SPILock.h"
 #include "TestUtil.h"
+#include "concurrency/LockGuard.h"
 #include "mesh-pb-constants.h"
+#include "mesh/CryptoEngine.h"
 #include "xmodem.h"
 #include <cstring>
 #include <unity.h>
+
+class MeshServiceTestAccess
+{
+  public:
+    /// Pretend the client last drained a packet `ms` ago.
+    static void ageClient(MeshService &service, PhoneAPI *client, uint32_t ms)
+    {
+        concurrency::LockGuard guard(&service.phoneClientsLock);
+        int i = service.findClientSlotByPtrLocked(client);
+        TEST_ASSERT_TRUE(i >= 0);
+        service.phoneClients[i].lastDrainMsec = millis() - ms;
+    }
+    static bool isSuspended(MeshService &service, PhoneAPI *client)
+    {
+        concurrency::LockGuard guard(&service.phoneClientsLock);
+        int i = service.findClientSlotByPtrLocked(client);
+        return i >= 0 && service.phoneClients[i].suspended;
+    }
+    static constexpr uint32_t kStaleMs = MeshService::kStaleClientDrainMs;
+};
 
 #if !MESHTASTIC_EXCLUDE_STOREFORWARD
 class StoreForwardTestAccess
@@ -39,15 +60,32 @@ static PhoneAPI *asClient(DummyClientToken &token)
     return reinterpret_cast<PhoneAPI *>(&token);
 }
 
-static meshtastic_MeshPacket *allocDecodedPacket(uint32_t id, NodeNum to = 0)
+static meshtastic_MeshPacket *allocDecodedPacket(uint32_t id, NodeNum to = 0,
+                                                 meshtastic_PortNum portnum = meshtastic_PortNum_TEXT_MESSAGE_APP)
 {
     meshtastic_MeshPacket *p = packetPool.allocZeroed();
     TEST_ASSERT_NOT_NULL(p);
     p->id = id;
     p->to = to;
     p->which_payload_variant = meshtastic_MeshPacket_decoded_tag;
-    p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+    p->decoded.portnum = portnum;
     return p;
+}
+
+static meshtastic_MeshPacket *allocTelemetryPacket(uint32_t id)
+{
+    return allocDecodedPacket(id, NODENUM_BROADCAST, meshtastic_PortNum_TELEMETRY_APP);
+}
+
+static void expectDrainOrder(MeshService &meshService, PhoneAPI *client, const uint32_t *ids, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        meshtastic_MeshPacket *p = meshService.getForPhone(client);
+        TEST_ASSERT_NOT_NULL(p);
+        TEST_ASSERT_EQUAL_UINT32(ids[i], p->id);
+        meshService.releaseToPoolForPhone(client, p);
+    }
+    TEST_ASSERT_NULL(meshService.getForPhone(client));
 }
 
 void test_fanout_packet_delivered_to_all_active_clients_once(void)
@@ -296,6 +334,133 @@ void test_close_from_other_context_then_late_release_is_safe(void)
     meshtastic_MeshPacket *uiPacket2 = meshService.getForPhone(uiClient);
     TEST_ASSERT_NOT_NULL(uiPacket2);
     meshService.releaseToPoolForPhone(uiClient, uiPacket2);
+}
+
+// 1b: the only client holding a payload is unregistered while it holds it; its late release must not free it again.
+void test_single_client_close_then_late_release_is_safe(void)
+{
+    MeshService meshService;
+    DummyClientToken token;
+    PhoneAPI *client = asClient(token);
+
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(client, MeshService::STATE_BLE));
+    meshService.sendToPhone(allocDecodedPacket(611, 0x6011));
+    meshtastic_MeshPacket *held = meshService.getForPhone(client);
+    TEST_ASSERT_NOT_NULL(held);
+
+    meshService.unregisterPhoneClient(client);       // last reference: the payload is released here
+    meshService.releaseToPoolForPhone(client, held); // no slot any more: must be a no-op, not a second release
+
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(client, MeshService::STATE_BLE));
+    TEST_ASSERT_NULL(meshService.getForPhone(client));
+    meshService.unregisterPhoneClient(client);
+}
+
+// 3: a full queue evicts its oldest non-text packet first; only a queue full of text drops a new non-text packet.
+void test_full_queue_evicts_oldest_non_text_first(void)
+{
+    MeshService meshService;
+    DummyClientToken token;
+    PhoneAPI *client = asClient(token);
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(client, MeshService::STATE_PACKET));
+
+    meshService.sendToPhone(allocDecodedPacket(1, NODENUM_BROADCAST)); // text
+    for (uint32_t id = 2; id <= MAX_RX_TOPHONE; id++)
+        meshService.sendToPhone(allocTelemetryPacket(id));
+    meshService.sendToPhone(allocTelemetryPacket(100));                  // evicts 2
+    meshService.sendToPhone(allocDecodedPacket(200, NODENUM_BROADCAST)); // evicts 3
+
+    uint32_t expected[MAX_RX_TOPHONE];
+    size_t n = 0;
+    expected[n++] = 1;
+    for (uint32_t id = 4; id <= MAX_RX_TOPHONE; id++)
+        expected[n++] = id;
+    expected[n++] = 100;
+    expected[n++] = 200;
+    expectDrainOrder(meshService, client, expected, n);
+
+    for (uint32_t id = 1; id <= MAX_RX_TOPHONE; id++)
+        meshService.sendToPhone(allocDecodedPacket(300 + id, NODENUM_BROADCAST));
+    meshService.sendToPhone(allocTelemetryPacket(999));                  // queue full of text: dropped
+    meshService.sendToPhone(allocDecodedPacket(500, NODENUM_BROADCAST)); // evicts the oldest text, 301
+    n = 0;
+    for (uint32_t id = 2; id <= MAX_RX_TOPHONE; id++)
+        expected[n++] = 300 + id;
+    expected[n++] = 500;
+    expectDrainOrder(meshService, client, expected, n);
+}
+
+// 3: the backlog kept while no client is connected follows the same policy.
+void test_full_detached_backlog_evicts_oldest_non_text_first(void)
+{
+    MeshService meshService;
+    meshService.sendToPhone(allocDecodedPacket(1, NODENUM_BROADCAST));
+    for (uint32_t id = 2; id <= MAX_RX_TOPHONE; id++)
+        meshService.sendToPhone(allocTelemetryPacket(id));
+    meshService.sendToPhone(allocTelemetryPacket(100)); // evicts 2
+
+    DummyClientToken token;
+    PhoneAPI *client = asClient(token);
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(client, MeshService::STATE_SERIAL));
+    uint32_t expected[MAX_RX_TOPHONE];
+    size_t n = 0;
+    expected[n++] = 1;
+    for (uint32_t id = 3; id <= MAX_RX_TOPHONE; id++)
+        expected[n++] = id;
+    expected[n++] = 100;
+    expectDrainOrder(meshService, client, expected, n);
+    meshService.unregisterPhoneClient(client);
+
+    for (uint32_t id = 1; id <= MAX_RX_TOPHONE; id++)
+        meshService.sendToPhone(allocDecodedPacket(300 + id, NODENUM_BROADCAST));
+    meshService.sendToPhone(allocTelemetryPacket(999)); // backlog full of text: dropped
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(client, MeshService::STATE_SERIAL));
+    n = 0;
+    for (uint32_t id = 1; id <= MAX_RX_TOPHONE; id++)
+        expected[n++] = 300 + id;
+    expectDrainOrder(meshService, client, expected, n);
+}
+
+// 3: a client that stops reading is suspended and its queue released, so it cannot pin payloads; it resumes as soon as
+// it reads again. A client that keeps reading (e.g. a long config download) is never suspended.
+void test_stale_client_suspended_and_released_until_it_reads(void)
+{
+    MeshService meshService;
+    DummyClientToken liveToken, stuckToken;
+    PhoneAPI *live = asClient(liveToken);
+    PhoneAPI *stuck = asClient(stuckToken);
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(live, MeshService::STATE_BLE));
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(stuck, MeshService::STATE_PACKET));
+
+    const uint32_t first[] = {1};
+    meshService.sendToPhone(allocTelemetryPacket(1));
+    expectDrainOrder(meshService, live, first, 1);
+
+    // Still reading (config download): not stale even though packets are pending.
+    MeshServiceTestAccess::ageClient(meshService, stuck, MeshServiceTestAccess::kStaleMs + 1000);
+    meshService.notePhoneClientRead(stuck);
+    meshService.sendToPhone(allocTelemetryPacket(2));
+    TEST_ASSERT_FALSE(MeshServiceTestAccess::isSuspended(meshService, stuck));
+
+    // Stops reading: the next packet suspends it and releases its queue.
+    MeshServiceTestAccess::ageClient(meshService, stuck, MeshServiceTestAccess::kStaleMs + 1000);
+    meshService.sendToPhone(allocTelemetryPacket(3));
+    TEST_ASSERT_TRUE(MeshServiceTestAccess::isSuspended(meshService, stuck));
+    meshService.sendToPhone(allocTelemetryPacket(4));
+    const uint32_t liveRest[] = {2, 3, 4};
+    expectDrainOrder(meshService, live, liveRest, 3);
+
+    // A suspended client neither blocks store-and-forward nor keeps the node awake.
+    TEST_ASSERT_TRUE(meshService.canAcceptStoreForwardPacket());
+    TEST_ASSERT_TRUE(meshService.isToPhoneQueueEmpty());
+
+    // Reading again resumes it with new traffic only.
+    TEST_ASSERT_NULL(meshService.getForPhone(stuck));
+    TEST_ASSERT_FALSE(MeshServiceTestAccess::isSuspended(meshService, stuck));
+    meshService.sendToPhone(allocTelemetryPacket(5));
+    const uint32_t fifth[] = {5};
+    expectDrainOrder(meshService, stuck, fifth, 1);
+    expectDrainOrder(meshService, live, fifth, 1);
 }
 
 // 2: a packet replayed from the store-and-forward history reaches every registered client, not just the first poller.
@@ -608,6 +773,10 @@ void setup()
     RUN_TEST(test_fanout_pool_capacity_accounts_for_inflight_all_clients);
     RUN_TEST(test_register_overflow_does_not_change_state_mask_or_existing_delivery);
     RUN_TEST(test_close_from_other_context_then_late_release_is_safe);
+    RUN_TEST(test_single_client_close_then_late_release_is_safe);
+    RUN_TEST(test_full_queue_evicts_oldest_non_text_first);
+    RUN_TEST(test_full_detached_backlog_evicts_oldest_non_text_first);
+    RUN_TEST(test_stale_client_suspended_and_released_until_it_reads);
     RUN_TEST(test_store_forward_packet_fanned_out_to_every_client);
     RUN_TEST(test_store_forward_gated_on_live_client_with_room);
 #if !MESHTASTIC_EXCLUDE_STOREFORWARD

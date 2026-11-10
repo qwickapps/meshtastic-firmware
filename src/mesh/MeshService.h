@@ -87,6 +87,8 @@ class MeshService
         PhoneAPI *client = nullptr;
         APIState state = STATE_DISCONNECTED;
         bool active = false;
+        /// Stale client whose queued packets were released; gets no packets until it reads again.
+        bool suspended = false;
         uint32_t lastDrainMsec = 0;
 
 #if defined(ARCH_PORTDUINO)
@@ -163,6 +165,9 @@ class MeshService
     /// holds the node awake and no longer throttles shared producers (e.g. store-and-forward replay).
     static constexpr uint32_t kStaleClientDrainMs = 30 * 1000;
     bool isSlotStaleLocked(PhoneClientSlot &slot);
+    void suspendIfStaleLocked(PhoneClientSlot &slot, int slotIndex);
+    void resumeLocked(PhoneClientSlot &slot);
+    bool makeRoomInPacketQueueLocked(PhoneClientSlot &slot, bool newIsText);
     void replayDetachedPacketBacklogLocked(PhoneClientSlot &slot);
     void updateApiStateLocked(APIState preferred = STATE_DISCONNECTED);
 
@@ -208,6 +213,9 @@ class MeshService
 
     /// Return the next packet destined to the specified phone client.
     meshtastic_MeshPacket *getForPhone(PhoneAPI *client);
+
+    /// The client just read a FromRadio (any kind): it is not stale. Never logs (called while FromRadio buffers are in use).
+    void notePhoneClientRead(PhoneAPI *client);
 
     /// Allows handlers to free packets after they have been sent
     void releaseToPool(meshtastic_MeshPacket *p) { packetPool.release(p); }
@@ -305,6 +313,7 @@ class MeshService
     /// needs to keep the packet around it makes a copy
     int handleFromRadio(const meshtastic_MeshPacket *p);
     friend class RoutingModule;
+    friend class MeshServiceTestAccess; // native unit tests (test/test_api_fanout)
 };
 
 extern MeshService *service;
