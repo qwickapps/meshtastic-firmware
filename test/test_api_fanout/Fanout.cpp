@@ -4,6 +4,7 @@
 #include "PhoneAPI.h"
 #include "Router.h"
 #include "SPILock.h"
+#include "BlePairingPinOwner.h"
 #include "BleSlotTable.h"
 #include "SessionHandoffQueue.h"
 #include "TestUtil.h"
@@ -677,6 +678,35 @@ void test_ble_slot_table_claim_release_and_limit(void)
     TEST_ASSERT_EQUAL_UINT32(3u, (uint32_t)single.usable());
 }
 
+// Multi-BLE pairing: the PIN on screen belongs to one connection. Another live connection is refused instead of sharing
+// it, and the PIN comes off screen when its own connection finishes, whatever other (unencrypted) links are up.
+void test_ble_pairing_pin_owner(void)
+{
+    BlePairingPinOwner p;
+    const uint16_t none = BlePairingPinOwner::kNoHandle;
+    TEST_ASSERT_FALSE(p.showing());
+    TEST_ASSERT_FALSE(p.heldByOther(5, true));
+    TEST_ASSERT_FALSE(p.release(5));
+
+    p.show(5);
+    TEST_ASSERT_TRUE(p.showing());
+    TEST_ASSERT_FALSE(p.heldByOther(5, true)); // owner re-pairing gets a new PIN
+    TEST_ASSERT_TRUE(p.heldByOther(7, true));
+    TEST_ASSERT_FALSE(p.heldByOther(7, false)); // owner gone
+    TEST_ASSERT_FALSE(p.release(7));            // an unrelated link finishing or leaving keeps the owner's PIN
+    TEST_ASSERT_TRUE(p.showing());
+    TEST_ASSERT_TRUE(p.release(5)); // owner done (success or failure): PIN off screen
+    TEST_ASSERT_FALSE(p.showing());
+    TEST_ASSERT_EQUAL_UINT16(none, p.owner());
+    TEST_ASSERT_FALSE(p.heldByOther(7, true));
+
+    // Unknown owner (single-central builds): any connection finishing clears, nobody is refused.
+    p.show(none);
+    TEST_ASSERT_FALSE(p.heldByOther(7, true));
+    TEST_ASSERT_TRUE(p.release(7));
+    TEST_ASSERT_FALSE(p.showing());
+}
+
 // 2: a packet replayed from the store-and-forward history reaches every registered client, not just the first poller.
 void test_store_forward_packet_fanned_out_to_every_client(void)
 {
@@ -1101,6 +1131,7 @@ void setup()
     RUN_TEST(test_ble_reconnect_before_runonce_closes_old_session_first);
     RUN_TEST(test_session_handoff_queue_bounds_and_disconnect);
     RUN_TEST(test_ble_slot_table_claim_release_and_limit);
+    RUN_TEST(test_ble_pairing_pin_owner);
     RUN_TEST(test_ble_log_pause_held_while_any_client_in_config);
     RUN_TEST(test_store_forward_packet_fanned_out_to_every_client);
     RUN_TEST(test_store_forward_gated_on_live_client_with_room);

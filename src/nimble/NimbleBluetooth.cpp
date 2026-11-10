@@ -7,6 +7,7 @@
 
 #include "concurrency/OSThread.h"
 #include "main.h"
+#include "mesh/BlePairingPinOwner.h"
 #include "mesh/BleSlotTable.h"
 #include "mesh/PhoneAPI.h"
 #include "mesh/SessionHandoffQueue.h"
@@ -73,8 +74,8 @@ NimBLECharacteristic *BatteryCharacteristic;
 NimBLECharacteristic *logRadioCharacteristic;
 NimBLEServer *bleServer;
 
-static bool passkeyShowing;
-static uint32_t shownPasskey; // the PIN on screen while passkeyShowing (NimBLE host task only)
+// The pairing PIN on screen and the connection it belongs to (NimBLE host task only).
+static BlePairingPinOwner pairingPin;
 
 // Connection handle -> client slot. Claimed / released only on the NimBLE host task; other tasks only read it.
 static BleSlotTable<MAX_BLE_PHONE_CLIENTS> bleSlots;
@@ -89,13 +90,13 @@ static const char *bleThreadName(uint8_t slot)
     return slot < sizeof(names) / sizeof(names[0]) ? names[slot] : "NimbleBluetoothN";
 }
 
-static void clearPairingDisplay()
+/// NimBLE task: `conn` finished authentication or disconnected; take the PIN off screen if it was that connection's.
+static void releasePairingDisplay(uint16_t conn)
 {
-    if (!passkeyShowing) {
+    if (!pairingPin.release(conn)) {
         return;
     }
 
-    passkeyShowing = false;
 #if HAS_SCREEN
     if (screen) {
         screen->endAlert();
@@ -621,6 +622,38 @@ static bool installFromRadioLongReadGuard(NimBLEService *service, NimBLECharacte
     }
     return false;
 }
+
+// NimBLE-Arduino 1.4.3 does not tell onPassKeyRequest() which connection it is for: wrap each connection's GAP callback so
+// PASSKEY_ACTION records its conn handle while NimBLEServer::handleGapEvent calls onPassKeyRequest (same host task).
+namespace
+{
+struct NimBLEServerGapEventTag {
+    using type = int (*)(struct ble_gap_event *, void *);
+    friend type privateMember(NimBLEServerGapEventTag);
+};
+template struct PrivateMemberAccess<NimBLEServerGapEventTag, &NimBLEServer::handleGapEvent>;
+} // namespace
+
+static uint16_t passkeyRequestConn = BLE_HS_CONN_HANDLE_NONE; // NimBLE host task only
+
+static int connGapEventWithPasskeyOwner(struct ble_gap_event *event, void *arg)
+{
+    static const auto nimbleServerGapEvent = privateMember(NimBLEServerGapEventTag());
+    if (event->type != BLE_GAP_EVENT_PASSKEY_ACTION)
+        return nimbleServerGapEvent(event, arg);
+    passkeyRequestConn = event->passkey.conn_handle;
+    int rc = nimbleServerGapEvent(event, arg);
+    passkeyRequestConn = BLE_HS_CONN_HANDLE_NONE;
+    return rc;
+}
+
+/// NimBLE task, GAP connect. The advertising instance is the callback argument NimBLE gave the connection.
+static void trackPasskeyRequests(uint16_t connHandle)
+{
+    int rc = ble_gap_set_event_cb(connHandle, connGapEventWithPasskeyOwner, NimBLEDevice::getAdvertising());
+    if (rc != 0)
+        LOG_WARN("BLE conn %u: cannot track its pairing PIN, rc=%d", connHandle, rc);
+}
 #endif
 
 /*
@@ -849,27 +882,6 @@ class NimbleBluetoothFromNumCallback : public NimBLECharacteristicCallbacks
 };
 #endif
 
-/// True if a connected central other than `exclude` has not finished pairing (its link is not encrypted yet).
-static bool anotherCentralStillPairing(uint16_t exclude)
-{
-    for (size_t i = 0; i < bleSlots.capacity; i++) {
-        uint16_t h = bleSlots.handleAt(i);
-        if (h == BLE_HS_CONN_HANDLE_NONE || h == exclude)
-            continue;
-        struct ble_gap_conn_desc desc;
-        if (ble_gap_conn_find(h, &desc) == 0 && !desc.sec_state.encrypted)
-            return true;
-    }
-    return false;
-}
-
-/// Take the PIN off the screen unless another central is still pairing and may need it.
-static void clearPairingDisplayUnlessStillNeeded(uint16_t finishedHandle)
-{
-    if (!anotherCentralStillPairing(finishedHandle))
-        clearPairingDisplay();
-}
-
 class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
 {
 #ifdef NIMBLE_TWO
@@ -885,18 +897,22 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
 #endif
     {
         uint32_t passkey = config.bluetooth.fixed_pin;
+#if MAX_BLE_PHONE_CLIENTS > 1
+        const uint16_t requestConn = passkeyRequestConn;
+#else
+        const uint16_t requestConn = BLE_HS_CONN_HANDLE_NONE;
+#endif
 
         if (config.bluetooth.mode == meshtastic_Config_BluetoothConfig_PairingMode_RANDOM_PIN) {
-            if (passkeyShowing) {
-                // Another central is pairing with the PIN on screen. Give this one the same PIN: a new one would replace the
-                // alert and the BluetoothStatus PIN, and the first central's user could no longer complete pairing.
-                LOG_INFO("Reuse the random passkey on screen for another pairing central");
-                powerFSM.trigger(EVENT_BLUETOOTH_PAIR);
-                return shownPasskey;
+            // A new 6-digit PIN for every pairing procedure, never reused: each failed passkey entry reveals bits of it.
+            passkey = random(100000, 999999);
+            if (pairingPin.heldByOther(requestConn, ble_gap_conn_find(pairingPin.owner(), nullptr) == 0)) {
+                // Neither share the PIN on screen nor replace it under the central that is pairing with it.
+                LOG_WARN("BLE conn %u refused: conn %u is pairing with the PIN on screen", requestConn, pairingPin.owner());
+                bleServer->disconnect(requestConn);
+                return passkey; // never shown
             }
             LOG_INFO("Use random passkey");
-            // This is the passkey to be entered on peer - we pick a number >100,000 to ensure 6 digits
-            passkey = random(100000, 999999);
         }
         LOG_INFO("*** Enter passkey %d on the peer side ***", passkey);
 
@@ -933,8 +949,7 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
             });
         }
 #endif
-        shownPasskey = passkey;
-        passkeyShowing = true;
+        pairingPin.show(requestConn);
 
         return passkey;
     }
@@ -950,17 +965,20 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
         meshtastic::BluetoothStatus newStatus(meshtastic::BluetoothStatus::ConnectionState::CONNECTED);
         bluetoothStatus->updateStatus(&newStatus);
 
-        // The connection already has its slot (claimed in onConnect).
+        // Success or failure: that connection's pairing is over. The connection already has its slot (claimed in onConnect).
 #ifdef NIMBLE_TWO
-        clearPairingDisplayUnlessStillNeeded(connInfo.getConnHandle());
+        releasePairingDisplay(connInfo.getConnHandle());
 #else
-        clearPairingDisplayUnlessStillNeeded(desc->conn_handle);
+        releasePairingDisplay(desc->conn_handle);
 #endif
     }
 
     /// NimBLE task: give a new connection its client slot, or refuse it when every slot is taken.
     void onCentralConnected(NimBLEServer *pServer, uint16_t connHandle)
     {
+#if MAX_BLE_PHONE_CLIENTS > 1
+        trackPasskeyRequests(connHandle);
+#endif
         int slot = bleSlots.claim(connHandle);
         if (slot < 0) {
             LOG_WARN("BLE conn %u refused: all %u BLE client slots in use", connHandle, (unsigned)bleSlots.usable());
@@ -1063,7 +1081,7 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
             meshtastic::BluetoothStatus newStatus(meshtastic::BluetoothStatus::ConnectionState::DISCONNECTED);
             bluetoothStatus->updateStatus(&newStatus);
         }
-        clearPairingDisplayUnlessStillNeeded(connHandle);
+        releasePairingDisplay(connHandle);
 
         // Restart Advertising
         resumeAdvertising();
