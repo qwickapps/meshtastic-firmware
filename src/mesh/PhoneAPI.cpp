@@ -662,13 +662,8 @@ void PhoneAPI::sendConfigComplete()
 void PhoneAPI::releasePhonePacket()
 {
     if (packetForPhone) {
-        if (packetForPhoneOrigin == PacketForPhoneOrigin::Fanout) {
-            service->releaseToPoolForPhone(this, packetForPhone);
-        } else if (packetForPhoneOrigin == PacketForPhoneOrigin::StoreForward) {
-            service->releaseToPool(packetForPhone);
-        }
+        service->releaseToPoolForPhone(this, packetForPhone); // we just copied the bytes, so don't need this buffer anymore
         packetForPhone = NULL;
-        packetForPhoneOrigin = PacketForPhoneOrigin::None;
     }
 }
 
@@ -779,10 +774,8 @@ bool PhoneAPI::available()
         }
 #endif
 
-        if (!packetForPhone) {
+        if (!packetForPhone)
             packetForPhone = service->getForPhone(this);
-            packetForPhoneOrigin = packetForPhone ? PacketForPhoneOrigin::Fanout : PacketForPhoneOrigin::None;
-        }
         hasPacket = !!packetForPhone;
         return hasPacket;
     }

@@ -727,11 +727,18 @@ void MeshService::loop()
     }
 #ifdef ARCH_ESP32
 #if !MESHTASTIC_EXCLUDE_STOREFORWARD
-    // Store-and-forward must enter the normal fanout queue once; polling it
-    // from individual PhoneAPI instances makes the first client steal history.
+    // As a S&F server, received text messages reach the phone clients only through the S&F history (sendToPhone()
+    // skips them). The history has a single cursor for the local node, so it is drained here, once, and fanned out to
+    // every registered client - polling it from individual PhoneAPI instances let the first client steal the history.
+    // Only pull while every live client has room, so nothing pulled out of the history is dropped on the floor; with no
+    // client connected the messages stay in the history until one connects.
     if (moduleConfig.store_forward.enabled && storeForwardModule && storeForwardModule->isServer()) {
-        if (auto p = storeForwardModule->getForPhone())
-            sendToPhone(p);
+        for (int n = 0; n < MAX_RX_TOPHONE && canAcceptStoreForwardPacket(); n++) {
+            meshtastic_MeshPacket *p = storeForwardModule->getForPhone();
+            if (!p)
+                break;
+            sendStoreForwardToPhone(p);
+        }
     }
 #endif
 #endif
@@ -934,8 +941,51 @@ bool MeshService::trySendPosition(NodeNum dest, bool wantReplies)
 
 void MeshService::sendToPhone(meshtastic_MeshPacket *p)
 {
+    if (!p)
+        return;
     perhapsDecode(p);
 
+#ifdef ARCH_ESP32
+#if !MESHTASTIC_EXCLUDE_STOREFORWARD
+    // A S&F server keeps every text message in its history and delivers it to the phone clients from loop(); sending
+    // it here as well would deliver it twice.
+    if (moduleConfig.store_forward.enabled && storeForwardModule && storeForwardModule->isServer() &&
+        p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP) {
+        releaseToPool(p); // Copy is already stored in StoreForward history
+        return;
+    }
+#endif
+#endif
+
+    enqueueToPhoneClients(p);
+}
+
+void MeshService::sendStoreForwardToPhone(meshtastic_MeshPacket *p)
+{
+    if (!p)
+        return;
+    perhapsDecode(p);
+    enqueueToPhoneClients(p);
+}
+
+bool MeshService::canAcceptStoreForwardPacket()
+{
+    concurrency::LockGuard guard(&phoneClientsLock);
+
+    bool anyLiveClient = false;
+    for (int i = 0; i < MAX_PHONE_API_CLIENTS; i++) {
+        auto &slot = phoneClients[i];
+        if (!slot.active || isSlotStaleLocked(slot))
+            continue;
+        if (slot.packetQueue.numFree() == 0)
+            return false;
+        anyLiveClient = true;
+    }
+    return anyLiveClient;
+}
+
+void MeshService::enqueueToPhoneClients(meshtastic_MeshPacket *p)
+{
     bool delivered = false;
     {
         concurrency::LockGuard guard(&phoneClientsLock);

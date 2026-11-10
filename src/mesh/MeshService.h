@@ -172,6 +172,7 @@ class MeshService
     void releaseClientNotificationFanoutEntryLocked(ClientNotificationFanoutEntry *entry);
 
     bool enqueuePacketFanoutLocked(meshtastic_MeshPacket *p);
+    void enqueueToPhoneClients(meshtastic_MeshPacket *p);
     bool enqueueQueueStatusFanoutLocked(meshtastic_QueueStatus *qs);
     bool enqueueMqttProxyFanoutLocked(meshtastic_MqttClientProxyMessage *m);
     bool enqueueClientNotificationFanoutLocked(meshtastic_ClientNotification *cn);
@@ -270,6 +271,14 @@ class MeshService
 
     /// Send a packet to active phone clients
     void sendToPhone(meshtastic_MeshPacket *p);
+
+    /// Fan a packet replayed from the store-and-forward history out to every registered phone client. Unlike
+    /// sendToPhone() this is not subject to the "S&F server delivers text from its history" filter.
+    void sendStoreForwardToPhone(meshtastic_MeshPacket *p);
+
+    /// True when at least one non-stale client is registered and every non-stale client has room for one more packet,
+    /// i.e. a packet pulled from the S&F history now would reach every live client without displacing anything.
+    bool canAcceptStoreForwardPacket();
 
     /// Send an MQTT message to active phone clients for client proxying
     virtual void sendMqttMessageToClientProxy(meshtastic_MqttClientProxyMessage *m);
