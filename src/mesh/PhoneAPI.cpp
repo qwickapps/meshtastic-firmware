@@ -159,8 +159,6 @@ void PhoneAPI::close()
         unobserve(&service->fromNumChanged);
 #ifdef FSCom
         unobserve(&xModem.packetReady);
-        xModem.abortFor(this); // a transfer bound to this client can never complete now
-        xmodemPacketForPhone = meshtastic_XModem_init_zero;
 #endif
         releasePhonePacket(); // Don't leak phone packets on shutdown
         releaseQueueStatusPhonePacket();
@@ -187,6 +185,11 @@ void PhoneAPI::close()
     } else {
         service->unregisterPhoneClient(this);
     }
+#ifdef FSCom
+    // In every state: a transfer bound to this client can never complete now, and a deleted PhoneAPI must not stay owner.
+    xModem.abortFor(this);
+    xmodemPacketForPhone = meshtastic_XModem_init_zero;
+#endif
     registrationRejected = false;
 }
 
@@ -228,7 +231,9 @@ bool PhoneAPI::handleToRadio(const uint8_t *buf, size_t bufLength)
         case meshtastic_ToRadio_xmodemPacket_tag:
             LOG_INFO("Got xmodem packet");
 #ifdef FSCom
-            if (!xModem.handlePacket(toRadioScratch.xmodemPacket, this)) {
+            if (!isConnected()) {
+                LOG_WARN("Ignore xmodem packet from a client without a config session");
+            } else if (!xModem.handlePacket(toRadioScratch.xmodemPacket, this)) {
                 // Another client owns the running transfer: tell this one to give up instead of leaving it waiting.
                 xmodemPacketForPhone = meshtastic_XModem_init_zero;
                 xmodemPacketForPhone.control = meshtastic_XModem_Control_CAN;

@@ -490,6 +490,54 @@ void test_xmodem_transfer_bound_to_owner_and_aborted_on_close(void)
     TEST_ASSERT_TRUE(adapter.handlePacket(xmodemControl(meshtastic_XModem_Control_STX, 0, "/no/such/xmodem/file"), b));
     TEST_ASSERT_EQUAL(meshtastic_XModem_Control_NAK, adapter.getForPhone(b).control);
 }
+
+class XModemTestPhoneAPI : public PhoneAPI
+{
+  public:
+    XModemTestPhoneAPI() { api_type = TYPE_SERIAL; }
+    void startConfig() { handleStartConfig(); }
+    void sendXModem(const meshtastic_XModem &x)
+    {
+        meshtastic_ToRadio tr = meshtastic_ToRadio_init_zero;
+        tr.which_payload_variant = meshtastic_ToRadio_xmodemPacket_tag;
+        tr.xmodemPacket = x;
+        uint8_t buf[meshtastic_ToRadio_size];
+        size_t len = pb_encode_to_bytes(buf, sizeof(buf), &meshtastic_ToRadio_msg, &tr);
+        handleToRadio(buf, len);
+    }
+
+  protected:
+    bool checkIsConnected() override { return true; }
+};
+
+// 4: a client without a config session cannot own a transfer, and closing a client always releases its transfer, so a
+// deleted PhoneAPI is never left as owner.
+void test_xmodem_owner_released_on_every_close(void)
+{
+    MeshService meshService;
+    MeshService *previousService = service;
+    service = &meshService;
+
+    {
+        XModemTestPhoneAPI unconfigured;
+        unconfigured.sendXModem(xmodemControl(meshtastic_XModem_Control_SOH, 0, "/xmodem_unconfigured.bin"));
+        TEST_ASSERT_FALSE(xModem.isBusy());
+        TEST_ASSERT_NULL(xModem.getTransferOwner());
+    }
+
+    {
+        XModemTestPhoneAPI client;
+        client.startConfig();
+        TEST_ASSERT_TRUE(client.isConnected());
+        client.sendXModem(xmodemControl(meshtastic_XModem_Control_SOH, 0, "/xmodem_close_test.bin"));
+        if (xModem.isBusy())
+            TEST_ASSERT_EQUAL_PTR(&client, xModem.getTransferOwner());
+    } // ~PhoneAPI -> close()
+
+    TEST_ASSERT_FALSE(xModem.isBusy());
+    TEST_ASSERT_NULL(xModem.getTransferOwner());
+    service = previousService;
+}
 #endif
 
 class RejectedTestPhoneAPI : public PhoneAPI
@@ -568,6 +616,7 @@ void setup()
 #ifdef FSCom
     RUN_TEST(test_xmodem_response_only_visible_to_requesting_client);
     RUN_TEST(test_xmodem_transfer_bound_to_owner_and_aborted_on_close);
+    RUN_TEST(test_xmodem_owner_released_on_every_close);
 #endif
     RUN_TEST(test_rejected_client_receives_error_notification);
     exit(UNITY_END());
