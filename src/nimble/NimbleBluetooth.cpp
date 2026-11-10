@@ -83,6 +83,30 @@ static BleSlotTable<MAX_BLE_PHONE_CLIENTS> bleSlots;
 // CCCD "notifications enabled" bit, as NimBLE reports it to onSubscribe.
 constexpr uint16_t kSubscribedNotify = 0x0001;
 
+#ifndef NIMBLE_TWO
+/// Main task. NimBLECharacteristic::notify() walks a subscriber vector the host task edits on every (un)subscribe and
+/// disconnect; notify one connection directly instead, with the same subscription and encryption checks.
+static void notifyConn(NimBLECharacteristic *chr, uint16_t conn_handle, uint16_t subscription, const uint8_t *val, size_t len)
+{
+    if (!(subscription & kSubscribedNotify))
+        return;
+
+    if (chr->getProperties() & (BLE_GATT_CHR_F_READ_AUTHEN | BLE_GATT_CHR_F_READ_AUTHOR | BLE_GATT_CHR_F_READ_ENC)) {
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(conn_handle, &desc) != 0 || !desc.sec_state.encrypted)
+            return;
+    }
+
+    os_mbuf *om = ble_hs_mbuf_from_flat(val, len);
+    if (!om)
+        return;
+    // ble_gattc_notify_custom always consumes om.
+    int rc = ble_gattc_notify_custom(conn_handle, chr->getHandle(), om);
+    if (rc != 0)
+        LOG_DEBUG("BLE conn %u notify of attr %u failed, rc=%d", conn_handle, chr->getHandle(), rc);
+}
+#endif
+
 static const char *bleThreadName(uint8_t slot)
 {
     // Slot 0 keeps the historical thread name.
@@ -193,6 +217,9 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
 
     /// fromNum CCCD value of this connection (set by the NimBLE task, read by the main task).
     std::atomic<uint16_t> fromNumSubscription{0};
+    /// logRadio and battery level CCCD values of this connection (set by the NimBLE task, read by the main task).
+    std::atomic<uint16_t> logRadioSubscription{0};
+    std::atomic<uint16_t> batterySubscription{0};
     /// Last fromNum value of this client, returned when this connection reads the fromNum characteristic.
     std::atomic<uint32_t> lastFromNum{0};
 
@@ -304,6 +331,8 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         // Clear the last ToRadio packet buffer to avoid rejecting first packet from new connection
         memset(lastToRadio, 0, sizeof(lastToRadio));
         fromNumSubscription = 0;
+        logRadioSubscription = 0;
+        batterySubscription = 0;
 #if MAX_BLE_PHONE_CLIENTS > 1
         longReadSnapshotLen = 0;
 #endif
@@ -463,33 +492,9 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
 #ifdef NIMBLE_TWO
         fromNumCharacteristic->notify(val, sizeof(val), conn_handle);
 #else
-        notifyFromNum(conn_handle, val, sizeof(val));
+        notifyConn(fromNumCharacteristic, conn_handle, fromNumSubscription.load(), val, sizeof(val));
 #endif
     }
-
-#ifndef NIMBLE_TWO
-    /// Main task. Same checks NimBLECharacteristic::notify() applies, but for one connection only.
-    void notifyFromNum(uint16_t conn_handle, const uint8_t *val, size_t len)
-    {
-        if (!(fromNumSubscription.load() & kSubscribedNotify))
-            return;
-
-        const uint16_t props = fromNumCharacteristic->getProperties();
-        if (props & (BLE_GATT_CHR_F_READ_AUTHEN | BLE_GATT_CHR_F_READ_AUTHOR | BLE_GATT_CHR_F_READ_ENC)) {
-            struct ble_gap_conn_desc desc;
-            if (ble_gap_conn_find(conn_handle, &desc) != 0 || !desc.sec_state.encrypted)
-                return;
-        }
-
-        os_mbuf *om = ble_hs_mbuf_from_flat(val, len);
-        if (!om)
-            return;
-        // ble_gattc_notify_custom always consumes om.
-        int rc = ble_gattc_notify_custom(conn_handle, fromNumCharacteristic->getHandle(), om);
-        if (rc != 0)
-            LOG_DEBUG("BLE conn %u fromNum notify failed, rc=%d", conn_handle, rc);
-    }
-#endif
 
     /// Check the current underlying physical link to see if the client is currently connected
     virtual bool checkIsConnected() { return bleServer && connHandle() != BLE_HS_CONN_HANDLE_NONE; }
@@ -551,6 +556,20 @@ static BluetoothPhoneAPI *apiForConn(uint16_t conn_handle)
     int slot = bleSlots.find(conn_handle);
     return slot >= 0 ? bluetoothPhoneAPIs[slot] : nullptr;
 }
+
+#ifndef NIMBLE_TWO
+/// Main task: notify every connected client subscribed to `chr` (its CCCD value is `subscription` in BluetoothPhoneAPI).
+static void notifyEachConn(NimBLECharacteristic *chr, std::atomic<uint16_t> BluetoothPhoneAPI::*subscription, const uint8_t *val,
+                           size_t len)
+{
+    for (size_t i = 0; i < MAX_BLE_PHONE_CLIENTS; i++) {
+        BluetoothPhoneAPI *api = bluetoothPhoneAPIs[i];
+        const uint16_t conn_handle = bleSlots.handleAt(i);
+        if (api && conn_handle != BLE_HS_CONN_HANDLE_NONE)
+            notifyConn(chr, conn_handle, (api->*subscription).load(), val, len);
+    }
+}
+#endif
 
 #if MAX_BLE_PHONE_CLIENTS > 1
 /*
@@ -879,6 +898,26 @@ class NimbleBluetoothFromNumCallback : public NimBLECharacteristicCallbacks
         if (api)
             api->fromNumSubscription = subValue;
     }
+};
+
+/// Records a notify-only characteristic's CCCD value per connection, for notifyEachConn.
+class NimbleBluetoothSubscriptionCallback : public NimBLECharacteristicCallbacks
+{
+  public:
+    explicit NimbleBluetoothSubscriptionCallback(std::atomic<uint16_t> BluetoothPhoneAPI::*subscription)
+        : subscription(subscription)
+    {
+    }
+
+    virtual void onSubscribe(NimBLECharacteristic *pCharacteristic, ble_gap_conn_desc *desc, uint16_t subValue) override
+    {
+        BluetoothPhoneAPI *api = apiForConn(desc->conn_handle);
+        if (api)
+            (api->*subscription) = subValue;
+    }
+
+  private:
+    std::atomic<uint16_t> BluetoothPhoneAPI::*const subscription;
 };
 #endif
 
@@ -1255,6 +1294,7 @@ void NimbleBluetooth::setupService()
 #ifndef NIMBLE_TWO
     fromNumCallbacks = new NimbleBluetoothFromNumCallback();
     fromNumCharacteristic->setCallbacks(fromNumCallbacks);
+    logRadioCharacteristic->setCallbacks(new NimbleBluetoothSubscriptionCallback(&BluetoothPhoneAPI::logRadioSubscription));
 #endif
 
     bleService->start();
@@ -1285,6 +1325,9 @@ void NimbleBluetooth::setupService()
     batteryLevelDescriptor->setFormat(NimBLE2904::FORMAT_UINT8);
     batteryLevelDescriptor->setNamespace(1);
     batteryLevelDescriptor->setUnit(0x27ad);
+#ifndef NIMBLE_TWO
+    BatteryCharacteristic->setCallbacks(new NimbleBluetoothSubscriptionCallback(&BluetoothPhoneAPI::batterySubscription));
+#endif
 
     batteryService->start();
 }
@@ -1335,7 +1378,7 @@ void updateBatteryLevel(uint8_t level)
 #ifdef NIMBLE_TWO
         BatteryCharacteristic->notify(&level, 1, BLE_HS_CONN_HANDLE_NONE);
 #else
-        BatteryCharacteristic->notify();
+        notifyEachConn(BatteryCharacteristic, &BluetoothPhoneAPI::batterySubscription, &level, 1);
 #endif
     }
 }
@@ -1354,7 +1397,7 @@ void NimbleBluetooth::sendLog(const uint8_t *logMessage, size_t length)
 #ifdef NIMBLE_TWO
     logRadioCharacteristic->notify(logMessage, length, BLE_HS_CONN_HANDLE_NONE);
 #else
-    logRadioCharacteristic->notify(logMessage, length, true);
+    notifyEachConn(logRadioCharacteristic, &BluetoothPhoneAPI::logRadioSubscription, logMessage, length);
 #endif
 }
 
