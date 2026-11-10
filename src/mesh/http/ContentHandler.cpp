@@ -62,6 +62,11 @@ char const *contentTypes[][2] = {{".txt", "text/plain"},     {".html", "text/htm
 // Our API to handle messages to and from the radio.
 HttpAPI webAPI;
 
+void checkHttpApiConnection()
+{
+    webAPI.checkConnection();
+}
+
 void registerHandlers(HTTPServer *insecureServer, HTTPSServer *secureServer)
 {
 

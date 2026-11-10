@@ -52,6 +52,10 @@ class PhoneAPI
 
     State state = STATE_SEND_NOTHING;
 
+    /// Set when handleStartConfig() could not get a MeshService fanout slot: a ClientNotification explaining why is sent
+    /// (outside the fanout, which this client is not part of) instead of leaving the client waiting silently.
+    bool registrationRejected = false;
+
     uint8_t config_state = 0;
 
     // Hashmap of timestamps for last time we received a packet on the API per portnum
@@ -65,6 +69,8 @@ class PhoneAPI
 
     /// We temporarily keep the packet here between the call to available and getFromRadio.  We will free it after the phone
     /// downloads it
+    /// Always owned by the MeshService fanout (store-and-forward replay is fanned out there too), so it is always released
+    /// through releaseToPoolForPhone().
     meshtastic_MeshPacket *packetForPhone = NULL;
 
     // file transfer packets destined for phone. Push it to the queue then free it.
@@ -137,6 +143,9 @@ class PhoneAPI
 
     bool isConnected() { return state != STATE_SEND_NOTHING; }
     bool isSendingPackets() { return state == STATE_SEND_PACKETS; }
+
+    /// Allow transports with their own service loop to expire a stale client.
+    bool checkConnection() { return checkConnectionTimeout(); }
 
   protected:
     /// Our fromradio packet while it is being assembled

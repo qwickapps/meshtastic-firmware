@@ -12,6 +12,7 @@
 #include "PowerFSM.h"
 #include "RTC.h"
 #include "TypeConversions.h"
+#include "Throttle.h"
 #include "concurrency/LockGuard.h"
 #include "graphics/draw/MessageRenderer.h"
 #include "main.h"
@@ -49,13 +50,29 @@ the new node can build its node db)
 
 MeshService *service;
 
-#define MAX_MQTT_PROXY_MESSAGES 16
+/*
+ * Payload pool sizing for the per-client fanout.
+ *
+ * A payload is allocated once and shared (refcounted) by every client queue it is fanned out to. For QueueStatus,
+ * MqttClientProxy and ClientNotification every active client receives every payload and a full queue drops its oldest
+ * entry, so the queues hold suffixes of one global sequence:
+ *
+ *   distinct live payloads <= QUEUE_DEPTH + MAX_PHONE_API_CLIENTS + 1
+ *
+ * MeshPackets (packetPool) do not follow this: a full packet queue evicts its oldest non-text entry first, so client
+ * queues diverge and up to MAX_PHONE_API_CLIENTS * (MAX_RX_TOPHONE + 1) packets can be alive. A client that stops
+ * reading is suspended after kStaleClientDrainMs and its queue released, which limits that to clients that keep reading.
+ * Producers must null-check: a payload that cannot be allocated is dropped, never dereferenced.
+ */
+#define FANOUT_PAYLOAD_POOL_SIZE(queueDepth) ((queueDepth) + MAX_PHONE_API_CLIENTS + 1)
+
+#define MAX_MQTT_PROXY_MESSAGES FANOUT_PAYLOAD_POOL_SIZE(MAX_RX_MQTTPROXY_TOPHONE)
 static MemoryPool<meshtastic_MqttClientProxyMessage, MAX_MQTT_PROXY_MESSAGES> staticMqttClientProxyMessagePool;
 
-#define MAX_QUEUE_STATUS 4
+#define MAX_QUEUE_STATUS FANOUT_PAYLOAD_POOL_SIZE(MAX_RX_QUEUESTATUS_TOPHONE)
 static MemoryPool<meshtastic_QueueStatus, MAX_QUEUE_STATUS> staticQueueStatusPool;
 
-#define MAX_CLIENT_NOTIFICATIONS 4
+#define MAX_CLIENT_NOTIFICATIONS FANOUT_PAYLOAD_POOL_SIZE(MAX_RX_NOTIFICATION_TOPHONE)
 static MemoryPool<meshtastic_ClientNotification, MAX_CLIENT_NOTIFICATIONS> staticClientNotificationPool;
 
 Allocator<meshtastic_MqttClientProxyMessage> &mqttClientProxyMessagePool = staticMqttClientProxyMessagePool;
@@ -66,9 +83,48 @@ Allocator<meshtastic_QueueStatus> &queueStatusPool = staticQueueStatusPool;
 
 #include "Router.h"
 
+namespace
+{
+/// Remove and return the oldest entry matching pred, keeping the order of the others; nullptr if none matches.
+template <class Queue, class Pred> auto removeOldestMatching(Queue &queue, Pred pred) -> decltype(queue.dequeuePtr(0))
+{
+    decltype(queue.dequeuePtr(0)) found = nullptr;
+    const int used = queue.numUsed();
+    for (int i = 0; i < used; i++) {
+        auto entry = queue.dequeuePtr(0);
+        if (!entry)
+            break;
+        if (!found && pred(entry))
+            found = entry;
+        else
+            queue.enqueue(entry, 0);
+    }
+    return found;
+}
+} // namespace
+
 MeshService::MeshService()
+#if defined(ARCH_PORTDUINO)
+    : detachedPacketBacklog(MAX_RX_TOPHONE)
+#endif
 {
     lastQueueStatus = {0, 0, 16, 0};
+}
+
+void MeshService::replayDetachedPacketBacklogLocked(PhoneClientSlot &slot)
+{
+    while (auto p = detachedPacketBacklog.dequeuePtr(0)) {
+        auto entry = packetFanoutPool.allocZeroed();
+        if (!entry) {
+            LOG_WARN("Failed to allocate packet fanout entry while replaying detached backlog");
+            releaseToPool(p);
+            continue;
+        }
+        entry->payload = p;
+        entry->refcount = 1;
+        if (!slot.packetQueue.enqueue(entry, 0))
+            releasePacketFanoutEntryLocked(entry);
+    }
 }
 
 int MeshService::findClientSlotByPtrLocked(const PhoneAPI *client) const
@@ -208,8 +264,50 @@ void MeshService::clearClientSlotLocked(PhoneClientSlot &slot)
     }
 
     slot.active = false;
+    slot.suspended = false;
+    slot.lastDrainMsec = 0;
     slot.state = STATE_DISCONNECTED;
     slot.client = nullptr;
+}
+
+bool MeshService::isSlotStaleLocked(PhoneClientSlot &slot)
+{
+    if (!slot.packetInflight && slot.packetQueue.isEmpty())
+        return false; // nothing pending, nothing to be stale about
+    return slot.lastDrainMsec != 0 && !Throttle::isWithinTimespanMs(slot.lastDrainMsec, kStaleClientDrainMs);
+}
+
+void MeshService::suspendIfStaleLocked(PhoneClientSlot &slot, int slotIndex)
+{
+    if (slot.suspended || !isSlotStaleLocked(slot))
+        return;
+    // The in-flight packet stays: the client may still hold a pointer to it.
+    int dropped = 0;
+    while (auto entry = slot.packetQueue.dequeuePtr(0)) {
+        releasePacketFanoutEntryLocked(entry);
+        dropped++;
+    }
+    slot.suspended = true;
+    LOG_WARN("Phone client slot %d read nothing for %us, drop its %d queued packets until it reads again", slotIndex,
+             (unsigned)(kStaleClientDrainMs / 1000), dropped);
+}
+
+void MeshService::resumeLocked(PhoneClientSlot &slot)
+{
+    slot.suspended = false;
+    slot.lastDrainMsec = millis();
+}
+
+bool MeshService::makeRoomInPacketQueueLocked(PhoneClientSlot &slot, bool newIsText)
+{
+    auto victim = removeOldestMatching(slot.packetQueue,
+                                       [](PacketFanoutEntry *e) { return !e->payload || !isTextPayload(e->payload); });
+    if (!victim && newIsText)
+        victim = slot.packetQueue.dequeuePtr(0); // only text queued: the oldest text makes room for the new one
+    if (!victim)
+        return false;
+    releasePacketFanoutEntryLocked(victim);
+    return true;
 }
 
 void MeshService::updateApiStateLocked(APIState preferred)
@@ -240,7 +338,7 @@ void MeshService::updateApiStateLocked(APIState preferred)
     api_state = STATE_DISCONNECTED;
 }
 
-bool MeshService::enqueuePacketFanoutLocked(meshtastic_MeshPacket *p)
+bool MeshService::enqueuePacketFanoutLocked(meshtastic_MeshPacket *p, const PhoneAPI *exclude)
 {
     if (!p)
         return false;
@@ -254,22 +352,34 @@ bool MeshService::enqueuePacketFanoutLocked(meshtastic_MeshPacket *p)
 
     entry->payload = p;
 
+    const bool newIsText = isTextPayload(p);
     bool delivered = false;
     for (int i = 0; i < MAX_PHONE_API_CLIENTS; i++) {
         auto &slot = phoneClients[i];
-        if (!slot.active)
+        if (!slot.active || (exclude && slot.client == exclude))
+            continue;
+
+        suspendIfStaleLocked(slot, i);
+        if (slot.suspended)
             continue;
 
         if (slot.packetQueue.numFree() == 0) {
-            LOG_WARN("Packet fanout queue full for client slot %d, drop oldest", i);
-            if (auto oldEntry = slot.packetQueue.dequeuePtr(0)) {
-                releasePacketFanoutEntryLocked(oldEntry);
+            if (makeRoomInPacketQueueLocked(slot, newIsText)) {
+                LOG_WARN("Packet fanout queue full for client slot %d, discard oldest non-text (or text) packet", i);
+            } else {
+                LOG_WARN("Packet fanout queue full of text for client slot %d, drop new non-text packet", i);
+                continue;
             }
         }
 
+        // A client that was idle has not failed to drain anything yet: start its drain clock now so it is not
+        // considered stale the moment a packet arrives after a quiet period.
+        const bool wasIdle = !slot.packetInflight && slot.packetQueue.isEmpty();
         if (slot.packetQueue.enqueue(entry, 0)) {
             entry->refcount++;
             delivered = true;
+            if (wasIdle)
+                slot.lastDrainMsec = millis();
         } else {
             LOG_WARN("Failed to enqueue packet fanout for client slot %d", i);
         }
@@ -431,7 +541,10 @@ bool MeshService::registerPhoneClient(PhoneAPI *client, APIState state)
     if (slotIndex < 0) {
         slotIndex = findFreeClientSlotLocked();
         if (slotIndex < 0) {
-            LOG_ERROR("No free phone client slots available (max=%d)", MAX_PHONE_API_CLIENTS);
+            LOG_ERROR("No free phone client slots (max=%d, in use: ble=%u wifi=%u serial=%u packet=%u http=%u eth=%u), "
+                      "rejecting new state=%d client",
+                      MAX_PHONE_API_CLIENTS, apiStateCounts[STATE_BLE], apiStateCounts[STATE_WIFI], apiStateCounts[STATE_SERIAL],
+                      apiStateCounts[STATE_PACKET], apiStateCounts[STATE_HTTP], apiStateCounts[STATE_ETH], state);
             return false;
         }
     }
@@ -447,6 +560,8 @@ bool MeshService::registerPhoneClient(PhoneAPI *client, APIState state)
     slot.client = client;
     slot.state = state;
     slot.active = true;
+    slot.lastDrainMsec = millis();
+    replayDetachedPacketBacklogLocked(slot);
 
     apiStateCounts[state]++;
     updateApiStateLocked(state);
@@ -487,10 +602,23 @@ meshtastic_MeshPacket *MeshService::getForPhone(PhoneAPI *client)
     if (!slot.active)
         return nullptr;
 
+    if (slot.suspended)
+        resumeLocked(slot);
+
     if (!slot.packetInflight)
         slot.packetInflight = slot.packetQueue.dequeuePtr(0);
 
     return slot.packetInflight ? slot.packetInflight->payload : nullptr;
+}
+
+void MeshService::notePhoneClientRead(PhoneAPI *client)
+{
+    concurrency::LockGuard guard(&phoneClientsLock);
+
+    int slotIndex = findClientSlotByPtrLocked(client);
+    if (slotIndex < 0 || !phoneClients[slotIndex].active)
+        return;
+    resumeLocked(phoneClients[slotIndex]);
 }
 
 meshtastic_QueueStatus *MeshService::getQueueStatusForPhone(PhoneAPI *client)
@@ -560,13 +688,13 @@ void MeshService::releaseToPoolForPhone(PhoneAPI *client, meshtastic_MeshPacket 
         if (slot.packetInflight && slot.packetInflight->payload == p) {
             auto *entry = slot.packetInflight;
             slot.packetInflight = nullptr;
+            slot.lastDrainMsec = millis();
             releasePacketFanoutEntryLocked(entry);
             return;
         }
     }
 
-    LOG_WARN("Packet release mismatch in fanout, releasing directly");
-    releaseToPool(p);
+    LOG_WARN("Packet release mismatch in fanout, retaining packet");
 }
 
 void MeshService::releaseQueueStatusToPoolForPhone(PhoneAPI *client, meshtastic_QueueStatus *p)
@@ -587,8 +715,7 @@ void MeshService::releaseQueueStatusToPoolForPhone(PhoneAPI *client, meshtastic_
         }
     }
 
-    LOG_WARN("QueueStatus release mismatch in fanout, releasing directly");
-    releaseQueueStatusToPool(p);
+    LOG_WARN("QueueStatus release mismatch in fanout, retaining packet");
 }
 
 void MeshService::releaseMqttClientProxyMessageToPoolForPhone(PhoneAPI *client, meshtastic_MqttClientProxyMessage *p)
@@ -609,8 +736,7 @@ void MeshService::releaseMqttClientProxyMessageToPoolForPhone(PhoneAPI *client, 
         }
     }
 
-    LOG_WARN("MqttClientProxy release mismatch in fanout, releasing directly");
-    releaseMqttClientProxyMessageToPool(p);
+    LOG_WARN("MqttClientProxy release mismatch in fanout, retaining packet");
 }
 
 void MeshService::releaseClientNotificationToPoolForPhone(PhoneAPI *client, meshtastic_ClientNotification *p)
@@ -631,8 +757,7 @@ void MeshService::releaseClientNotificationToPoolForPhone(PhoneAPI *client, mesh
         }
     }
 
-    LOG_WARN("ClientNotification release mismatch in fanout, releasing directly");
-    releaseClientNotificationToPool(p);
+    LOG_WARN("ClientNotification release mismatch in fanout, retaining packet");
 }
 
 void MeshService::init()
@@ -689,6 +814,23 @@ void MeshService::loop()
         if (result == 0) // If any observer returns non-zero, we will try again
             oldFromNum = fromNum;
     }
+#ifdef ARCH_ESP32
+#if !MESHTASTIC_EXCLUDE_STOREFORWARD
+    // As a S&F server, received text messages reach the phone clients only through the S&F history (sendToPhone()
+    // skips them). The history has a single cursor for the local node, so it is drained here, once, and fanned out to
+    // every registered client - polling it from individual PhoneAPI instances let the first client steal the history.
+    // Only pull while every live client has room, so nothing pulled out of the history is dropped on the floor; with no
+    // client connected the messages stay in the history until one connects.
+    if (moduleConfig.store_forward.enabled && storeForwardModule && storeForwardModule->isServer()) {
+        for (int n = 0; n < MAX_RX_TOPHONE && canAcceptStoreForwardPacket(); n++) {
+            meshtastic_MeshPacket *p = storeForwardModule->getForPhone();
+            if (!p)
+                break;
+            sendStoreForwardToPhone(p);
+        }
+    }
+#endif
+#endif
 }
 
 /// The radioConfig object just changed, call this to force the hw to change to the new settings
@@ -758,7 +900,7 @@ NodeNum MeshService::getNodenumFromRequestId(uint32_t request_id)
  * Called by PhoneAPI.handleToRadio.  Note: p is a scratch buffer, this function is allowed to write to it but it can not keep a
  * reference
  */
-void MeshService::handleToRadio(meshtastic_MeshPacket &p)
+void MeshService::handleToRadio(meshtastic_MeshPacket &p, const PhoneAPI *origin)
 {
 #if defined(ARCH_PORTDUINO)
     if (SimRadio::instance && p.decoded.portnum == meshtastic_PortNum_SIMULATOR_APP) {
@@ -787,7 +929,17 @@ void MeshService::handleToRadio(meshtastic_MeshPacket &p)
     DEBUG_HEAP_BEFORE;
     auto a = packetPool.allocCopy(p);
     DEBUG_HEAP_AFTER("MeshService::handleToRadio", a);
-    sendToMesh(a, RX_SRC_USER);
+    // Copy before sending: the router may release or encrypt `a`.
+    meshtastic_MeshPacket *echo = (origin && isSharedWithOtherClients(&p)) ? packetPool.allocCopy(p) : nullptr;
+    ErrorCode res = sendToMesh(a, RX_SRC_USER);
+    if (echo) {
+        if (res == ERRNO_OK || res == ERRNO_SHOULD_RELEASE) {
+            echo->from = nodeDB->getNodeNum();
+            sendToOtherPhones(echo, origin);
+        } else {
+            releaseToPool(echo);
+        }
+    }
 
     bool loopback = false; // if true send any packet the phone sends back itself (for testing)
     if (loopback) {
@@ -829,7 +981,7 @@ ErrorCode MeshService::sendQueueStatusToPhone(const meshtastic_QueueStatus &qs, 
     return ERRNO_UNKNOWN;
 }
 
-void MeshService::sendToMesh(meshtastic_MeshPacket *p, RxSource src, bool ccToPhone)
+ErrorCode MeshService::sendToMesh(meshtastic_MeshPacket *p, RxSource src, bool ccToPhone)
 {
     uint32_t mesh_packet_id = p->id;
     nodeDB->updateFrom(*p); // update our local DB for this packet (because phone might have sent position packets etc...)
@@ -857,6 +1009,7 @@ void MeshService::sendToMesh(meshtastic_MeshPacket *p, RxSource src, bool ccToPh
     if (res == ERRNO_SHOULD_RELEASE) {
         releaseToPool(p);
     }
+    return res;
 }
 
 bool MeshService::trySendPosition(NodeNum dest, bool wantReplies)
@@ -888,23 +1041,92 @@ bool MeshService::trySendPosition(NodeNum dest, bool wantReplies)
 
 void MeshService::sendToPhone(meshtastic_MeshPacket *p)
 {
+    if (!p)
+        return;
     perhapsDecode(p);
 
 #ifdef ARCH_ESP32
 #if !MESHTASTIC_EXCLUDE_STOREFORWARD
-    if (moduleConfig.store_forward.enabled && storeForwardModule->isServer() &&
+    // A S&F server keeps every text message in its history and delivers it to the phone clients from loop(); sending
+    // it here as well would deliver it twice.
+    if (moduleConfig.store_forward.enabled && storeForwardModule && storeForwardModule->isServer() &&
         p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP) {
         releaseToPool(p); // Copy is already stored in StoreForward history
-        if (api_state_mask != 0)
-            fromNum++; // Notify observers for packet from radio when there are active API clients
         return;
     }
 #endif
 #endif
 
+    enqueueToPhoneClients(p);
+}
+
+void MeshService::sendStoreForwardToPhone(meshtastic_MeshPacket *p)
+{
+    if (!p)
+        return;
+    perhapsDecode(p);
+    enqueueToPhoneClients(p);
+}
+
+void MeshService::sendToOtherPhones(meshtastic_MeshPacket *p, const PhoneAPI *origin)
+{
+    if (!p)
+        return;
     bool delivered = false;
     {
         concurrency::LockGuard guard(&phoneClientsLock);
+        // Unlike received packets this never goes to the detached backlog: the sender itself saw it.
+        if (api_state_mask == 0) {
+            releaseToPool(p);
+            return;
+        }
+        delivered = enqueuePacketFanoutLocked(p, origin);
+    }
+    if (delivered)
+        fromNum++;
+}
+
+bool MeshService::canAcceptStoreForwardPacket()
+{
+    concurrency::LockGuard guard(&phoneClientsLock);
+
+    bool anyLiveClient = false;
+    for (int i = 0; i < MAX_PHONE_API_CLIENTS; i++) {
+        auto &slot = phoneClients[i];
+        if (!slot.active || slot.suspended || isSlotStaleLocked(slot))
+            continue;
+        if (slot.packetQueue.numFree() == 0)
+            return false;
+        anyLiveClient = true;
+    }
+    return anyLiveClient;
+}
+
+void MeshService::enqueueToPhoneClients(meshtastic_MeshPacket *p)
+{
+    bool delivered = false;
+    {
+        concurrency::LockGuard guard(&phoneClientsLock);
+        if (api_state_mask == 0) {
+            if (detachedPacketBacklog.numFree() == 0) {
+                auto old = removeOldestMatching(detachedPacketBacklog,
+                                                [](meshtastic_MeshPacket *q) { return !isTextPayload(q); });
+                if (!old && isTextPayload(p))
+                    old = detachedPacketBacklog.dequeuePtr(0);
+                if (!old) {
+                    LOG_WARN("Detached phone backlog full of text, drop new non-text packet");
+                    releaseToPool(p);
+                    return;
+                }
+                LOG_WARN("Detached phone backlog full, discard oldest non-text (or text) packet");
+                releaseToPool(old);
+            }
+            if (!detachedPacketBacklog.enqueue(p, 0)) {
+                LOG_WARN("Failed to enqueue packet in detached phone backlog");
+                releaseToPool(p);
+            }
+            return;
+        }
         delivered = enqueuePacketFanoutLocked(p);
     }
 
@@ -915,6 +1137,8 @@ void MeshService::sendToPhone(meshtastic_MeshPacket *p)
 
 void MeshService::sendMqttMessageToClientProxy(meshtastic_MqttClientProxyMessage *m)
 {
+    if (!m)
+        return;
     LOG_DEBUG("Send mqtt message on topic '%s' to client for proxy", m->topic);
 
     bool delivered = false;
@@ -1029,6 +1253,8 @@ bool MeshService::isToPhoneQueueEmpty()
             continue;
 
         if (slot.packetInflight || !slot.packetQueue.isEmpty()) {
+            if (isSlotStaleLocked(slot))
+                continue;
             return false;
         }
     }

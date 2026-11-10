@@ -8,6 +8,7 @@
 #include "concurrency/OSThread.h"
 #include "main.h"
 #include "mesh/PhoneAPI.h"
+#include "mesh/SessionHandoffQueue.h"
 #include "mesh/mesh-pb-constants.h"
 #include "sleep.h"
 #include <NimBLEDevice.h>
@@ -83,9 +84,9 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
       being run concurrently, which would make everything else much much much more complicated.
 
       PHONE -> RADIO:
-        - [NimBLE FreeRTOS task:] onWrite callback holds fromPhoneMutex and pushes received packets into fromPhoneQueue.
-        - [Main task:] runOnceHandleFromPhoneQueue in main task holds fromPhoneMutex, pulls packets from fromPhoneQueue, and calls
-      handleToRadio **in main task**.
+        - [NimBLE FreeRTOS task:] onWrite callback pushes received packets into fromPhone (SessionHandoffQueue, own mutex).
+        - [Main task:] runOnceHandleFromPhoneQueue in main task pops packets from fromPhone and calls handleToRadio **in main
+      task**.
 
       RADIO -> PHONE:
         - [NimBLE FreeRTOS task:] onRead callback sets onReadCallbackIsWaitingForData flag and polls in a busy loop. (unless
@@ -97,11 +98,20 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
       pops the packet from toPhoneQueue, and returns it to NimBLE.
 
       MUTEXES:
-        - fromPhoneMutex protects fromPhoneQueue and fromPhoneQueueSize
+        - fromPhone has its own mutex (see SessionHandoffQueue)
         - toPhoneMutex protects toPhoneQueue, toPhoneQueueByteSizes, and toPhoneQueueSize
 
+      DISCONNECT:
+        - [NimBLE FreeRTOS task:] onDisconnect only clears the transport queues and calls fromPhone.disconnect().
+        - [Main task:] runOnce consumes the pending close and calls PhoneAPI::close() **in main task**. close() releases the
+      fanout packets PhoneAPI holds (packetForPhone etc.) and unregisters from MeshService; doing that from the NimBLE task
+      raced getFromRadio() on the main task (use-after-free / double release of packetForPhone).
+        - A reconnect can arrive before runOnce runs. SessionHandoffQueue::pop() reports the pending close together with the
+      new connection's first ToRadio, so the old session is always closed before that is handled. FromRadio data produced
+      for the old session is dropped instead of being pushed to the new connection.
+
       ATOMICS:
-        - fromPhoneQueueSize is only increased by onWrite, and only decreased by runOnceHandleFromPhoneQueue (or onDisconnect).
+        - fromPhone's size is only increased by onWrite, and only decreased by runOnceHandleFromPhoneQueue (or onDisconnect).
         - toPhoneQueueSize is only increased by runOnceHandleToPhoneQueue, and only decreased by onRead (or onDisconnect).
         - onReadCallbackIsWaitingForData is a flag. It's only set by onRead, and only cleared by runOnceHandleToPhoneQueue (or
       onDisconnect).
@@ -114,7 +124,7 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
 
       MEMORY MANAGEMENT:
         - We keep packets on the stack and do not allocate heap.
-        - We use std::array for fromPhoneQueue and toPhoneQueue to avoid mallocs and frees across FreeRTOS tasks.
+        - We use std::array for fromPhone and toPhoneQueue to avoid mallocs and frees across FreeRTOS tasks.
         - Yes, we have to do some copy operations on pop because of this, but it's worth it to avoid cross-task memory management.
 
       NOTIFY IS BROKEN:
@@ -135,11 +145,9 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
   public:
     BluetoothPhoneAPI() : concurrency::OSThread("NimbleBluetooth") { api_type = TYPE_BLE; }
 
-    /* Packets from phone (BLE onWrite callback) */
-    std::mutex fromPhoneMutex;
-    std::atomic<size_t> fromPhoneQueueSize{0};
-    // We use array here (and pay the cost of memcpy) to avoid dynamic memory allocations and frees across FreeRTOS tasks.
-    std::array<NimBLEAttValue, NIMBLE_BLUETOOTH_FROM_PHONE_QUEUE_SIZE> fromPhoneQueue{};
+    /* Packets from phone (BLE onWrite callback), and the disconnect handoff to the main task (see DISCONNECT) */
+    // Array-backed (memcpy) to avoid dynamic memory allocations and frees across FreeRTOS tasks.
+    SessionHandoffQueue<NimBLEAttValue, NIMBLE_BLUETOOTH_FROM_PHONE_QUEUE_SIZE> fromPhone;
 
     /* Packets to phone (BLE onRead callback) */
     std::mutex toPhoneMutex;
@@ -160,6 +168,9 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
     virtual int32_t runOnce() override
     {
         while (runOnceHasWorkToDo()) {
+            // A disconnect must be fully processed before anything else for this transport.
+            runOnceHandlePendingClose();
+
             /*
               PROCESS fromPhoneQueue BEFORE toPhoneQueue:
 
@@ -213,7 +224,26 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         }
     }
 
-    bool runOnceHasWorkToDo() { return runOnceHasWorkToPhone() || runOnceHasWorkFromPhone(); }
+    bool runOnceHasWorkToDo() { return fromPhone.hasPendingClose() || runOnceHasWorkToPhone() || runOnceHasWorkFromPhone(); }
+
+    /// Main task only: close the PhoneAPI session of a connection that onDisconnect reported.
+    void performDeferredClose()
+    {
+        LOG_INFO("BLE: close phone API session of disconnected client");
+        close();
+        // Nothing produced for the old session may reach the next connection.
+        std::lock_guard<std::mutex> guard(toPhoneMutex);
+        toPhoneQueueSize = 0;
+    }
+
+    /// Main task only. Returns true if a pending close was performed.
+    bool runOnceHandlePendingClose()
+    {
+        if (!fromPhone.takePendingClose())
+            return false;
+        performDeferredClose();
+        return true;
+    }
 
     bool runOnceHasWorkToPhone() { return onReadCallbackIsWaitingForData || runOnceToPhoneCanPreloadNextPacket(); }
 
@@ -248,6 +278,8 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         uint8_t fromRadioBytes[meshtastic_FromRadio_size] = {0};
         size_t numBytes = 0;
 
+        runOnceHandlePendingClose();
+
         if (onReadCallbackIsWaitingForData || runOnceToPhoneCanPreloadNextPacket()) {
             numBytes = getFromRadio(fromRadioBytes);
 
@@ -269,10 +301,15 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
 
                     { // scope for toPhoneMutex mutex
                         std::lock_guard<std::mutex> guard(toPhoneMutex);
-                        size_t storeAtIndex = toPhoneQueueSize.load();
-                        memcpy(toPhoneQueue[storeAtIndex].data(), fromRadioBytes, numBytes);
-                        toPhoneQueueByteSizes[storeAtIndex] = numBytes;
-                        toPhoneQueueSize++;
+                        if (fromPhone.hasPendingClose()) {
+                            // The client disconnected while we were producing this; it belongs to the old session.
+                            numBytes = 0;
+                        } else {
+                            size_t storeAtIndex = toPhoneQueueSize.load();
+                            memcpy(toPhoneQueue[storeAtIndex].data(), fromRadioBytes, numBytes);
+                            toPhoneQueueByteSizes[storeAtIndex] = numBytes;
+                            toPhoneQueueSize++;
+                        }
                     }
 #ifdef DEBUG_NIMBLE_ON_READ_TIMING
                     LOG_DEBUG("BLE getFromRadio returned numBytes=%u, pushed toPhoneQueueSize=%u", numBytes,
@@ -289,34 +326,22 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         }
     }
 
-    bool runOnceHasWorkFromPhone() { return fromPhoneQueueSize > 0; }
+    bool runOnceHasWorkFromPhone() { return fromPhone.size() > 0; }
 
     void runOnceHandleFromPhoneQueue()
     {
         // Handle packets we received from onWrite from the phone.
-        if (fromPhoneQueueSize > 0) {
-            // Note: the comparison above is safe without a mutex because we are the only method that *decreases*
-            // fromPhoneQueueSize. (It's okay if fromPhoneQueueSize *increases* in the NimBLE task meanwhile.)
+        if (fromPhone.size() > 0 || fromPhone.hasPendingClose()) {
+            LOG_DEBUG("NimbleBluetooth: handling ToRadio packet, fromPhoneQueueSize=%u", (unsigned)fromPhone.size());
 
-            LOG_DEBUG("NimbleBluetooth: handling ToRadio packet, fromPhoneQueueSize=%u", fromPhoneQueueSize.load());
-
-            // Pop the front of fromPhoneQueue, holding the mutex only briefly while we pop.
+            // If a disconnect happened, everything still queued belongs to a *new* connection, so the old session is
+            // closed before handling it.
             NimBLEAttValue val;
-            { // scope for fromPhoneMutex mutex
-                std::lock_guard<std::mutex> guard(fromPhoneMutex);
-                val = fromPhoneQueue[0];
-
-                // Shift the rest of the queue down
-                for (uint8_t i = 1; i < fromPhoneQueueSize; i++) {
-                    fromPhoneQueue[i - 1] = fromPhoneQueue[i];
-                }
-
-                // Safe decrement due to onDisconnect
-                if (fromPhoneQueueSize > 0)
-                    fromPhoneQueueSize--;
-            }
-
-            handleToRadio(val.data(), val.length());
+            auto popped = fromPhone.pop(val);
+            if (popped.closeFirst)
+                performDeferredClose();
+            if (popped.havePacket)
+                handleToRadio(val.data(), val.length());
         }
     }
 
@@ -431,29 +456,20 @@ class NimbleBluetoothToRadioCallback : public NimBLECharacteristicCallbacks
         auto val = pCharacteristic->getValue();
 
         if (memcmp(lastToRadio, val.data(), val.length()) != 0) {
-            if (bluetoothPhoneAPI->fromPhoneQueueSize < NIMBLE_BLUETOOTH_FROM_PHONE_QUEUE_SIZE) {
-                // Note: the comparison above is safe without a mutex because we are the only method that *increases*
-                // fromPhoneQueueSize. (It's okay if fromPhoneQueueSize *decreases* in the main task meanwhile.)
+            if (bluetoothPhoneAPI->fromPhone.push(val)) {
                 memcpy(lastToRadio, val.data(), val.length());
 
-                { // scope for fromPhoneMutex mutex
-                    // Append to fromPhoneQueue, protected by fromPhoneMutex. Hold the mutex as briefly as possible.
-                    std::lock_guard<std::mutex> guard(bluetoothPhoneAPI->fromPhoneMutex);
-                    bluetoothPhoneAPI->fromPhoneQueue.at(bluetoothPhoneAPI->fromPhoneQueueSize) = val;
-                    bluetoothPhoneAPI->fromPhoneQueueSize++;
-                }
-
-                // After releasing the mutex, schedule immediate processing of the new packet.
+                // Schedule immediate processing of the new packet.
                 bluetoothPhoneAPI->setIntervalFromNow(0);
                 concurrency::mainDelay.interrupt(); // wake up main loop if sleeping
 
 #ifdef DEBUG_NIMBLE_ON_WRITE_TIMING
                 int finishMillis = millis();
-                LOG_DEBUG("BLE onWrite(%d): append to fromPhoneQueue took %u ms. numBytes=%d", currentWriteCount,
+                LOG_DEBUG("BLE onWrite(%d): append to fromPhone took %u ms. numBytes=%d", currentWriteCount,
                           finishMillis - startMillis, val.length());
 #endif
             } else {
-                LOG_WARN("BLE onWrite(%d): Drop ToRadio packet, fromPhoneQueue full (%u bytes)", currentWriteCount, val.length());
+                LOG_WARN("BLE onWrite(%d): Drop ToRadio packet, fromPhone full (%u bytes)", currentWriteCount, val.length());
             }
         } else {
             LOG_DEBUG("BLE onWrite(%d): Drop duplicate ToRadio packet (%u bytes)", currentWriteCount, val.length());
@@ -704,12 +720,9 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
         clearPairingDisplay();
 
         if (bluetoothPhoneAPI) {
-            bluetoothPhoneAPI->close();
-
-            { // scope for fromPhoneMutex mutex
-                std::lock_guard<std::mutex> guard(bluetoothPhoneAPI->fromPhoneMutex);
-                bluetoothPhoneAPI->fromPhoneQueueSize = 0;
-            }
+            // Do NOT call close() here: this runs in the NimBLE task while the main task may be inside getFromRadio()
+            // holding packetForPhone. Ask the main task to close instead (see DISCONNECT notes in BluetoothPhoneAPI).
+            bluetoothPhoneAPI->fromPhone.disconnect();
 
             bluetoothPhoneAPI->onReadCallbackIsWaitingForData = false;
             { // scope for toPhoneMutex mutex
@@ -720,6 +733,9 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
             bluetoothPhoneAPI->readCount = 0;
             bluetoothPhoneAPI->notifyCount = 0;
             bluetoothPhoneAPI->writeCount = 0;
+
+            bluetoothPhoneAPI->setIntervalFromNow(0);
+            concurrency::mainDelay.interrupt(); // wake up main loop if sleeping
         }
 
         // Clear the last ToRadio packet buffer to avoid rejecting first packet from new connection

@@ -94,26 +94,72 @@ int XModemAdapter::check(const pb_byte_t *buf, int sz, unsigned short tcrc)
     return crc16_ccitt(buf, sz) == tcrc;
 }
 
+void XModemAdapter::notifyPacketReady()
+{
+    storeOwner = requester;
+    packetReady.notifyObservers(packetno);
+}
+
 void XModemAdapter::sendControl(meshtastic_XModem_Control c)
 {
     xmodemStore = meshtastic_XModem_init_zero;
     xmodemStore.control = c;
     LOG_DEBUG("XModem: Notify Send control %d", c);
-    packetReady.notifyObservers(packetno);
+    notifyPacketReady();
 }
 
-meshtastic_XModem XModemAdapter::getForPhone()
+meshtastic_XModem XModemAdapter::getForPhone(const PhoneAPI *client)
 {
+    if (storeOwner && storeOwner != client) {
+        meshtastic_XModem none = meshtastic_XModem_init_zero;
+        return none;
+    }
     return xmodemStore;
 }
 
-void XModemAdapter::resetForPhone()
+void XModemAdapter::resetForPhone(const PhoneAPI *client)
 {
+    if (storeOwner && storeOwner != client)
+        return;
     xmodemStore = meshtastic_XModem_init_zero;
+    storeOwner = nullptr;
 }
 
-void XModemAdapter::handlePacket(meshtastic_XModem xmodemPacket)
+void XModemAdapter::abortFor(const PhoneAPI *client)
 {
+    if (!client)
+        return;
+
+    if (storeOwner == client) {
+        xmodemStore = meshtastic_XModem_init_zero;
+        storeOwner = nullptr;
+    }
+
+    if (transferOwner == client) {
+        if (isReceiving || isTransmitting) {
+            LOG_WARN("XModem: client disconnected during transfer of %s, abort", filename);
+            spiLock->lock();
+            file.close();
+            if (isReceiving)
+                FSCom.remove(filename); // incomplete upload, same as CAN
+            spiLock->unlock();
+        }
+        isReceiving = false;
+        isTransmitting = false;
+        isEOT = false;
+        retrans = MAXRETRANS;
+        transferOwner = nullptr;
+    }
+}
+
+bool XModemAdapter::handlePacket(meshtastic_XModem xmodemPacket, const PhoneAPI *client)
+{
+    if ((isReceiving || isTransmitting) && transferOwner && transferOwner != client) {
+        LOG_WARN("XModem: transfer of %s in progress for another client, reject control %d", filename, xmodemPacket.control);
+        return false;
+    }
+    requester = client;
+
     switch (xmodemPacket.control) {
     case meshtastic_XModem_Control_SOH:
     case meshtastic_XModem_Control_STX:
@@ -126,9 +172,10 @@ void XModemAdapter::handlePacket(meshtastic_XModem xmodemPacket)
                 file = FSCom.open(filename, FILE_O_WRITE);
                 spiLock->unlock();
                 if (file) {
-                    sendControl(meshtastic_XModem_Control_ACK);
                     isReceiving = true;
+                    transferOwner = client;
                     packetno = 1;
+                    sendControl(meshtastic_XModem_Control_ACK);
                     break;
                 }
                 sendControl(meshtastic_XModem_Control_NAK);
@@ -142,6 +189,7 @@ void XModemAdapter::handlePacket(meshtastic_XModem xmodemPacket)
                 if (file) {
                     packetno = 1;
                     isTransmitting = true;
+                    transferOwner = client;
                     xmodemStore = meshtastic_XModem_init_zero;
                     xmodemStore.control = meshtastic_XModem_Control_SOH;
                     xmodemStore.seq = packetno;
@@ -154,7 +202,7 @@ void XModemAdapter::handlePacket(meshtastic_XModem xmodemPacket)
                         isEOT = true;
                         // send EOT on next Ack
                     }
-                    packetReady.notifyObservers(packetno);
+                    notifyPacketReady();
                     break;
                 }
                 sendControl(meshtastic_XModem_Control_NAK);
@@ -232,7 +280,7 @@ void XModemAdapter::handlePacket(meshtastic_XModem xmodemPacket)
                 isEOT = true;
                 // send EOT on next Ack
             }
-            packetReady.notifyObservers(packetno);
+            notifyPacketReady();
         } else {
             // just received something weird.
             sendControl(meshtastic_XModem_Control_CAN);
@@ -264,7 +312,7 @@ void XModemAdapter::handlePacket(meshtastic_XModem xmodemPacket)
                 isEOT = true;
                 // send EOT on next Ack
             }
-            packetReady.notifyObservers(packetno);
+            notifyPacketReady();
         } else {
             // just received something weird.
             sendControl(meshtastic_XModem_Control_CAN);
@@ -274,5 +322,9 @@ void XModemAdapter::handlePacket(meshtastic_XModem xmodemPacket)
         // Unknown control character
         break;
     }
+
+    if (!isReceiving && !isTransmitting)
+        transferOwner = nullptr;
+    return true;
 }
 #endif

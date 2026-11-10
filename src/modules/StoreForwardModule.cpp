@@ -151,27 +151,10 @@ uint32_t StoreForwardModule::getNumAvailablePackets(NodeNum dest, uint32_t last_
  */
 meshtastic_MeshPacket *StoreForwardModule::getForPhone()
 {
-    if (moduleConfig.store_forward.enabled && is_server) {
-        NodeNum to = nodeDB->getNodeNum();
-        if (!this->busy) {
-            // Get number of packets we're going to send in this loop
-            uint32_t histSize = getNumAvailablePackets(to, 0); // No time limit
-            if (histSize) {
-                this->busy = true;
-                this->busyTo = to;
-            } else {
-                return nullptr;
-            }
-        }
-
-        // We're busy with sending to us until no payload is available anymore
-        if (this->busy && this->busyTo == to) {
-            meshtastic_MeshPacket *p = preparePayload(to, 0, true); // No time limit
-            if (!p)                                                 // No more messages to send
-                this->busy = false;
-            return p;
-        }
-    }
+    // Only MeshService::loop() reads the local cursor. busy/busyTo belong to remote history requests: setting them here
+    // made runOnce() send the rest of the local history to ourselves as STORE_FORWARD_APP instead of TEXT_MESSAGE_APP.
+    if (moduleConfig.store_forward.enabled && is_server)
+        return preparePayload(nodeDB->getNodeNum(), 0, true); // No time limit
     return nullptr;
 }
 

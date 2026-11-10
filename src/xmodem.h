@@ -40,6 +40,13 @@
 
 #ifdef FSCom
 
+class PhoneAPI;
+
+/**
+ * There is a single XModem engine (one open file), but several phone API clients can be connected at once. A transfer is
+ * therefore bound to the client that started it: packets from other clients are rejected while it runs, and every response
+ * is addressed to the client whose packet produced it, so other clients never consume it.
+ */
 class XModemAdapter
 {
   public:
@@ -48,14 +55,28 @@ class XModemAdapter
 
     XModemAdapter();
 
-    void handlePacket(meshtastic_XModem xmodemPacket);
-    meshtastic_XModem getForPhone();
-    void resetForPhone();
+    /// Handle a packet from `client`. Returns false (and does nothing) if a transfer owned by another client is running.
+    bool handlePacket(meshtastic_XModem xmodemPacket, const PhoneAPI *client = nullptr);
+    /// The pending response for `client`, or an empty (control NUL) packet if the pending response is for someone else.
+    meshtastic_XModem getForPhone(const PhoneAPI *client = nullptr);
+    /// Drop the pending response, only if it is addressed to `client`.
+    void resetForPhone(const PhoneAPI *client = nullptr);
+    /// `client` went away: drop its pending response and abort its transfer (a partially received file is removed).
+    void abortFor(const PhoneAPI *client);
+
+    bool isBusy() const { return isReceiving || isTransmitting; }
+    const PhoneAPI *getTransferOwner() const { return transferOwner; }
 
   private:
     bool isReceiving = false;
     bool isTransmitting = false;
     bool isEOT = false;
+
+    const PhoneAPI *transferOwner = nullptr; // client that started the running transfer
+    const PhoneAPI *requester = nullptr;     // client whose packet is being handled
+    const PhoneAPI *storeOwner = nullptr;    // client xmodemStore is addressed to
+
+    void notifyPacketReady();
 
     int retrans = MAXRETRANS;
 
