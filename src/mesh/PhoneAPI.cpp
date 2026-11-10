@@ -154,6 +154,8 @@ void PhoneAPI::close()
         unobserve(&service->fromNumChanged);
 #ifdef FSCom
         unobserve(&xModem.packetReady);
+        xModem.abortFor(this); // a transfer bound to this client can never complete now
+        xmodemPacketForPhone = meshtastic_XModem_init_zero;
 #endif
         releasePhonePacket(); // Don't leak phone packets on shutdown
         releaseQueueStatusPhonePacket();
@@ -220,7 +222,12 @@ bool PhoneAPI::handleToRadio(const uint8_t *buf, size_t bufLength)
         case meshtastic_ToRadio_xmodemPacket_tag:
             LOG_INFO("Got xmodem packet");
 #ifdef FSCom
-            xModem.handlePacket(toRadioScratch.xmodemPacket);
+            if (!xModem.handlePacket(toRadioScratch.xmodemPacket, this)) {
+                // Another client owns the running transfer: tell this one to give up instead of leaving it waiting.
+                xmodemPacketForPhone = meshtastic_XModem_init_zero;
+                xmodemPacketForPhone.control = meshtastic_XModem_Control_CAN;
+                onNowHasData(fromRadioNum);
+            }
 #endif
             break;
 #if !MESHTASTIC_EXCLUDE_MQTT
@@ -766,12 +773,14 @@ bool PhoneAPI::available()
             return true;
 
 #ifdef FSCom
-        if (xmodemPacketForPhone.control == meshtastic_XModem_Control_NUL)
-            xmodemPacketForPhone = xModem.getForPhone();
-        if (xmodemPacketForPhone.control != meshtastic_XModem_Control_NUL) {
-            xModem.resetForPhone();
-            return true;
+        // Only responses addressed to this client: another client's transfer must not be consumed here.
+        if (xmodemPacketForPhone.control == meshtastic_XModem_Control_NUL) {
+            xmodemPacketForPhone = xModem.getForPhone(this);
+            if (xmodemPacketForPhone.control != meshtastic_XModem_Control_NUL)
+                xModem.resetForPhone(this);
         }
+        if (xmodemPacketForPhone.control != meshtastic_XModem_Control_NUL)
+            return true;
 #endif
 
         if (!packetForPhone)
