@@ -7,6 +7,7 @@
 
 #include "concurrency/OSThread.h"
 #include "main.h"
+#include "mesh/BleSlotTable.h"
 #include "mesh/PhoneAPI.h"
 #include "mesh/SessionHandoffQueue.h"
 #include "mesh/mesh-pb-constants.h"
@@ -45,13 +46,47 @@ constexpr uint16_t kPreferredBleTxTimeUs = (kPreferredBleTxOctets + 14) * 8;
 #define NIMBLE_BLUETOOTH_TO_PHONE_QUEUE_SIZE 3
 #define NIMBLE_BLUETOOTH_FROM_PHONE_QUEUE_SIZE 3
 
+/*
+  MULTIPLE CENTRALS:
+    Up to MAX_BLE_PHONE_CLIENTS centrals (phone, tablet, watch) can be connected at once. Each connection gets a slot in
+    bleSlots and its own BluetoothPhoneAPI (registered as a separate MeshService fan-out client), with its own ToRadio /
+    FromRadio queues, fromNum notify state, duplicate filter and deferred close. Only the NimBLE host task claims or releases
+    a slot (GAP connect / disconnect); the main task only reads the table. Advertising resumes after a connect while slots
+    remain. With one central connected, behaviour is the same as the single-connection design.
+*/
+#ifndef MAX_BLE_PHONE_CLIENTS
+#define MAX_BLE_PHONE_CLIENTS 1
+#endif
+#if MAX_BLE_PHONE_CLIENTS < 1
+#error "MAX_BLE_PHONE_CLIENTS must be at least 1"
+#endif
+#if MAX_BLE_PHONE_CLIENTS > 1 && defined(NIMBLE_TWO)
+#error "MAX_BLE_PHONE_CLIENTS > 1 needs the NimBLE-Arduino 1.x per-connection long-read guard (see FromRadio long reads)"
+#endif
+#if !defined(NIMBLE_TWO) && defined(CONFIG_BT_NIMBLE_MAX_CONNECTIONS)
+static_assert(MAX_BLE_PHONE_CLIENTS <= CONFIG_BT_NIMBLE_MAX_CONNECTIONS,
+              "MAX_BLE_PHONE_CLIENTS exceeds the NimBLE connection limit (CONFIG_BT_NIMBLE_MAX_CONNECTIONS)");
+#endif
+
 NimBLECharacteristic *fromNumCharacteristic;
 NimBLECharacteristic *BatteryCharacteristic;
 NimBLECharacteristic *logRadioCharacteristic;
 NimBLEServer *bleServer;
 
 static bool passkeyShowing;
-static std::atomic<uint16_t> nimbleBluetoothConnHandle{BLE_HS_CONN_HANDLE_NONE}; // BLE_HS_CONN_HANDLE_NONE means "no connection"
+
+// Connection handle -> client slot. Claimed / released only on the NimBLE host task; other tasks only read it.
+static BleSlotTable<MAX_BLE_PHONE_CLIENTS> bleSlots;
+
+// CCCD "notifications enabled" bit, as NimBLE reports it to onSubscribe.
+constexpr uint16_t kSubscribedNotify = 0x0001;
+
+static const char *bleThreadName(uint8_t slot)
+{
+    // Slot 0 keeps the historical thread name.
+    static const char *const names[] = {"NimbleBluetooth", "NimbleBluetooth1", "NimbleBluetooth2", "NimbleBluetooth3"};
+    return slot < sizeof(names) / sizeof(names[0]) ? names[slot] : "NimbleBluetoothN";
+}
 
 static void clearPairingDisplay()
 {
@@ -143,7 +178,21 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
     */
 
   public:
-    BluetoothPhoneAPI() : concurrency::OSThread("NimbleBluetooth") { api_type = TYPE_BLE; }
+    explicit BluetoothPhoneAPI(uint8_t slot) : concurrency::OSThread(bleThreadName(slot)), slot(slot) { api_type = TYPE_BLE; }
+
+    /// Index of this client's slot in bleSlots.
+    const uint8_t slot;
+
+    /// Handle of the connection currently in this slot, or BLE_HS_CONN_HANDLE_NONE. Any task.
+    uint16_t connHandle() const { return bleSlots.handleAt(slot); }
+
+    /// Last ToRadio value received on this connection (NimBLE task only), to drop duplicate writes.
+    uint8_t lastToRadio[MAX_TO_FROM_RADIO_SIZE] = {0};
+
+    /// fromNum CCCD value of this connection (set by the NimBLE task, read by the main task).
+    std::atomic<uint16_t> fromNumSubscription{0};
+    /// Last fromNum value of this client, returned when this connection reads the fromNum characteristic.
+    std::atomic<uint32_t> lastFromNum{0};
 
     /* Packets from phone (BLE onWrite callback), and the disconnect handoff to the main task (see DISCONNECT) */
     // Array-backed (memcpy) to avoid dynamic memory allocations and frees across FreeRTOS tasks.
@@ -204,7 +253,7 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
 
         // Prefer high throughput during config/setup, at the cost of high power consumption (for a few seconds)
         if (bleServer && isConnected()) {
-            uint16_t conn_handle = nimbleBluetoothConnHandle.load();
+            uint16_t conn_handle = connHandle();
             if (conn_handle != BLE_HS_CONN_HANDLE_NONE) {
                 requestHighThroughputConnection(conn_handle);
             }
@@ -217,13 +266,41 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
 
         // Switch to lower power consumption BLE connection params for steady-state use after config/setup is complete
         if (bleServer && isConnected()) {
-            uint16_t conn_handle = nimbleBluetoothConnHandle.load();
+            uint16_t conn_handle = connHandle();
             if (conn_handle != BLE_HS_CONN_HANDLE_NONE) {
                 requestLowerPowerConnection(conn_handle);
             }
         }
     }
 
+  public:
+    /// NimBLE task: this slot's connection is gone. Only clears the transport queues; PhoneAPI::close() runs on the main
+    /// task (see DISCONNECT).
+    void onTransportDisconnected()
+    {
+        // Do NOT call close() here: this runs in the NimBLE task while the main task may be inside getFromRadio()
+        // holding packetForPhone. Ask the main task to close instead (see DISCONNECT notes in BluetoothPhoneAPI).
+        fromPhone.disconnect();
+
+        onReadCallbackIsWaitingForData = false;
+        { // scope for toPhoneMutex mutex
+            std::lock_guard<std::mutex> guard(toPhoneMutex);
+            toPhoneQueueSize = 0;
+        }
+
+        readCount = 0;
+        notifyCount = 0;
+        writeCount = 0;
+
+        // Clear the last ToRadio packet buffer to avoid rejecting first packet from new connection
+        memset(lastToRadio, 0, sizeof(lastToRadio));
+        fromNumSubscription = 0;
+
+        setIntervalFromNow(0);
+        concurrency::mainDelay.interrupt(); // wake up main loop if sleeping
+    }
+
+  protected:
     bool runOnceHasWorkToDo() { return fromPhone.hasPendingClose() || runOnceHasWorkToPhone() || runOnceHasWorkFromPhone(); }
 
     /// Main task only: close the PhoneAPI session of a connection that onDisconnect reported.
@@ -363,19 +440,47 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
 
         uint8_t val[4];
         put_le32(val, fromRadioNum);
+        lastFromNum = fromRadioNum;
 
         fromNumCharacteristic->setValue(val, sizeof(val));
+
+        // Notify only this client's own connection: another central has its own fromNum.
+        const uint16_t conn_handle = connHandle();
+        if (conn_handle == BLE_HS_CONN_HANDLE_NONE)
+            return;
 #ifdef NIMBLE_TWO
-        // NOTE: I don't have any NIMBLE_TWO devices, but this line makes me suspicious, and I suspect it needs to just be
-        // notify().
-        fromNumCharacteristic->notify(val, sizeof(val), BLE_HS_CONN_HANDLE_NONE);
+        fromNumCharacteristic->notify(val, sizeof(val), conn_handle);
 #else
-        fromNumCharacteristic->notify();
+        notifyFromNum(conn_handle, val, sizeof(val));
 #endif
     }
 
+#ifndef NIMBLE_TWO
+    /// Main task. Same checks NimBLECharacteristic::notify() applies, but for one connection only.
+    void notifyFromNum(uint16_t conn_handle, const uint8_t *val, size_t len)
+    {
+        if (!(fromNumSubscription.load() & kSubscribedNotify))
+            return;
+
+        const uint16_t props = fromNumCharacteristic->getProperties();
+        if (props & (BLE_GATT_CHR_F_READ_AUTHEN | BLE_GATT_CHR_F_READ_AUTHOR | BLE_GATT_CHR_F_READ_ENC)) {
+            struct ble_gap_conn_desc desc;
+            if (ble_gap_conn_find(conn_handle, &desc) != 0 || !desc.sec_state.encrypted)
+                return;
+        }
+
+        os_mbuf *om = ble_hs_mbuf_from_flat(val, len);
+        if (!om)
+            return;
+        // ble_gattc_notify_custom always consumes om.
+        int rc = ble_gattc_notify_custom(conn_handle, fromNumCharacteristic->getHandle(), om);
+        if (rc != 0)
+            LOG_DEBUG("BLE conn %u fromNum notify failed, rc=%d", conn_handle, rc);
+    }
+#endif
+
     /// Check the current underlying physical link to see if the client is currently connected
-    virtual bool checkIsConnected() { return bleServer && bleServer->getConnectedCount() > 0; }
+    virtual bool checkIsConnected() { return bleServer && connHandle() != BLE_HS_CONN_HANDLE_NONE; }
 
     void requestHighThroughputConnection(uint16_t conn_handle)
     {
@@ -426,25 +531,47 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
     }
 };
 
-static BluetoothPhoneAPI *bluetoothPhoneAPI;
-/**
- * Subclasses can use this as a hook to provide custom notifications for their transport (i.e. bluetooth notifies)
- */
+static BluetoothPhoneAPI *bluetoothPhoneAPIs[MAX_BLE_PHONE_CLIENTS];
 
-// Last ToRadio value received from the phone
-static uint8_t lastToRadio[MAX_TO_FROM_RADIO_SIZE];
+/// The client of the connection `conn_handle`, or nullptr if that connection has no slot. Any task.
+static BluetoothPhoneAPI *apiForConn(uint16_t conn_handle)
+{
+    int slot = bleSlots.find(conn_handle);
+    return slot >= 0 ? bluetoothPhoneAPIs[slot] : nullptr;
+}
+
+/*
+  NimBLE-Arduino 1.x DOUBLE DISPATCH:
+    NimBLECharacteristic::handleGapEvent (NimBLECharacteristic.cpp:288-289 for reads, :319-320 for writes) calls BOTH
+    onRead(chr) and onRead(chr, desc), and both onWrite(chr) and onWrite(chr, desc); NimBLEServer does the same for
+    onConnect / onDisconnect (NimBLEServer.cpp:368-369). Override exactly one overload of each (the one that carries the
+    connection), never both, or every read pops two FromRadio packets and every write is queued twice.
+*/
 
 class NimbleBluetoothToRadioCallback : public NimBLECharacteristicCallbacks
 {
 #ifdef NIMBLE_TWO
-    virtual void onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo)
+    virtual void onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) override
+    {
+        handleWrite(pCharacteristic, connInfo.getConnHandle());
+    }
 #else
-    virtual void onWrite(NimBLECharacteristic *pCharacteristic)
-
+    virtual void onWrite(NimBLECharacteristic *pCharacteristic, ble_gap_conn_desc *desc) override
+    {
+        handleWrite(pCharacteristic, desc->conn_handle);
+    }
 #endif
+
+    void handleWrite(NimBLECharacteristic *pCharacteristic, uint16_t conn_handle)
     {
         // CAUTION: This callback runs in the NimBLE task!!! Don't do anything except communicate with the main task's runOnce.
         // Assumption: onWrite is serialized by NimBLE, so we don't need to lock here against multiple concurrent onWrite calls.
+
+        BluetoothPhoneAPI *bluetoothPhoneAPI = apiForConn(conn_handle);
+        if (!bluetoothPhoneAPI) {
+            LOG_WARN("BLE onWrite: drop ToRadio from conn %u, which has no client slot", conn_handle);
+            return;
+        }
 
         int currentWriteCount = bluetoothPhoneAPI->writeCount.fetch_add(1);
 
@@ -455,6 +582,7 @@ class NimbleBluetoothToRadioCallback : public NimBLECharacteristicCallbacks
 
         auto val = pCharacteristic->getValue();
 
+        uint8_t *lastToRadio = bluetoothPhoneAPI->lastToRadio;
         if (memcmp(lastToRadio, val.data(), val.length()) != 0) {
             if (bluetoothPhoneAPI->fromPhone.push(val)) {
                 memcpy(lastToRadio, val.data(), val.length());
@@ -480,12 +608,28 @@ class NimbleBluetoothToRadioCallback : public NimBLECharacteristicCallbacks
 class NimbleBluetoothFromRadioCallback : public NimBLECharacteristicCallbacks
 {
 #ifdef NIMBLE_TWO
-    virtual void onRead(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo)
+    virtual void onRead(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) override
+    {
+        handleRead(pCharacteristic, connInfo.getConnHandle());
+    }
 #else
-    virtual void onRead(NimBLECharacteristic *pCharacteristic)
+    virtual void onRead(NimBLECharacteristic *pCharacteristic, ble_gap_conn_desc *desc) override
+    {
+        handleRead(pCharacteristic, desc->conn_handle);
+    }
 #endif
+
+    void handleRead(NimBLECharacteristic *pCharacteristic, uint16_t conn_handle)
     {
         // CAUTION: This callback runs in the NimBLE task!!! Don't do anything except communicate with the main task's runOnce.
+
+        BluetoothPhoneAPI *bluetoothPhoneAPI = apiForConn(conn_handle);
+        if (!bluetoothPhoneAPI) {
+            LOG_WARN("BLE onRead: conn %u has no client slot, returning an empty FromRadio", conn_handle);
+            uint8_t none = 0;
+            pCharacteristic->setValue(&none, 0);
+            return;
+        }
 
         int currentReadCount = bluetoothPhoneAPI->readCount.fetch_add(1);
         int tries = 0;
@@ -589,6 +733,50 @@ class NimbleBluetoothFromRadioCallback : public NimBLECharacteristicCallbacks
     }
 };
 
+#ifndef NIMBLE_TWO
+/// fromNum is per client: each connection reads its own last fromNum, and onNowHasData notifies only its own connection.
+class NimbleBluetoothFromNumCallback : public NimBLECharacteristicCallbacks
+{
+    virtual void onRead(NimBLECharacteristic *pCharacteristic, ble_gap_conn_desc *desc) override
+    {
+        BluetoothPhoneAPI *api = apiForConn(desc->conn_handle);
+        if (!api)
+            return;
+        uint8_t val[4];
+        put_le32(val, api->lastFromNum.load());
+        pCharacteristic->setValue(val, sizeof(val));
+    }
+
+    virtual void onSubscribe(NimBLECharacteristic *pCharacteristic, ble_gap_conn_desc *desc, uint16_t subValue) override
+    {
+        BluetoothPhoneAPI *api = apiForConn(desc->conn_handle);
+        if (api)
+            api->fromNumSubscription = subValue;
+    }
+};
+#endif
+
+/// True if a connected central other than `exclude` has not finished pairing (its link is not encrypted yet).
+static bool anotherCentralStillPairing(uint16_t exclude)
+{
+    for (size_t i = 0; i < bleSlots.capacity; i++) {
+        uint16_t h = bleSlots.handleAt(i);
+        if (h == BLE_HS_CONN_HANDLE_NONE || h == exclude)
+            continue;
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(h, &desc) == 0 && !desc.sec_state.encrypted)
+            return true;
+    }
+    return false;
+}
+
+/// Take the PIN off the screen unless another central is still pairing and may need it.
+static void clearPairingDisplayUnlessStillNeeded(uint16_t finishedHandle)
+{
+    if (!anotherCentralStillPairing(finishedHandle))
+        clearPairingDisplay();
+}
+
 class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
 {
 #ifdef NIMBLE_TWO
@@ -660,15 +848,60 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
 
         meshtastic::BluetoothStatus newStatus(meshtastic::BluetoothStatus::ConnectionState::CONNECTED);
         bluetoothStatus->updateStatus(&newStatus);
-        clearPairingDisplay();
 
-        // Store the connection handle for future use
+        // The connection already has its slot (claimed in onConnect).
 #ifdef NIMBLE_TWO
-        nimbleBluetoothConnHandle = connInfo.getConnHandle();
+        clearPairingDisplayUnlessStillNeeded(connInfo.getConnHandle());
 #else
-        nimbleBluetoothConnHandle = desc->conn_handle;
+        clearPairingDisplayUnlessStillNeeded(desc->conn_handle);
 #endif
     }
+
+    /// NimBLE task: give a new connection its client slot, or refuse it when every slot is taken.
+    void onCentralConnected(NimBLEServer *pServer, uint16_t connHandle)
+    {
+        int slot = bleSlots.claim(connHandle);
+        if (slot < 0) {
+            LOG_WARN("BLE conn %u refused: all %u BLE client slots in use", connHandle, (unsigned)bleSlots.usable());
+            pServer->disconnect(connHandle);
+            return;
+        }
+        LOG_INFO("BLE conn %u uses client slot %d (%u of %u in use)", connHandle, slot, (unsigned)bleSlots.count(),
+                 (unsigned)bleSlots.usable());
+
+        // The controller stops advertising when a central connects; keep advertising while another central can join.
+        if (!bleSlots.full())
+            resumeAdvertising();
+    }
+
+    void resumeAdvertising()
+    {
+#ifdef NIMBLE_TWO
+        ble->startAdvertising();
+#else
+        NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
+        if (!pAdvertising->start(0)) {
+            if (pAdvertising->isAdvertising()) {
+                LOG_DEBUG("BLE advertising already running");
+            } else {
+                LOG_ERROR("BLE failed to restart advertising");
+            }
+        }
+#endif
+    }
+
+#ifndef NIMBLE_TWO
+    virtual void onConnect(NimBLEServer *pServer, ble_gap_conn_desc *desc) override
+    {
+        LOG_INFO("BLE incoming connection, conn %u", desc->conn_handle);
+        onCentralConnected(pServer, desc->conn_handle);
+    }
+
+    virtual void onMTUChange(uint16_t MTU, ble_gap_conn_desc *desc) override
+    {
+        LOG_INFO("BLE conn %u MTU %u", desc->conn_handle, MTU);
+    }
+#endif
 
 #ifdef NIMBLE_TWO
     virtual void onConnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo)
@@ -695,6 +928,8 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
 
         LOG_INFO("BLE conn %u initial MTU %u (target %u)", connHandle, connInfo.getMTU(), kPreferredBleMtu);
         pServer->updateConnParams(connHandle, 6, 12, 0, 200);
+
+        onCentralConnected(pServer, connHandle);
     }
 #endif
 
@@ -702,10 +937,12 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
     virtual void onDisconnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo, int reason)
     {
         LOG_INFO("BLE disconnect reason: %d", reason);
+        const uint16_t connHandle = connInfo.getConnHandle();
 #else
     virtual void onDisconnect(NimBLEServer *pServer, ble_gap_conn_desc *desc)
     {
-        LOG_INFO("BLE disconnect");
+        LOG_INFO("BLE disconnect, conn %u", desc->conn_handle);
+        const uint16_t connHandle = desc->conn_handle;
 #endif
 #ifdef NIMBLE_TWO
         if (ble->isDeInit)
@@ -715,52 +952,28 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
             return;
 #endif
 
-        meshtastic::BluetoothStatus newStatus(meshtastic::BluetoothStatus::ConnectionState::DISCONNECTED);
-        bluetoothStatus->updateStatus(&newStatus);
-        clearPairingDisplay();
+        // Hand this connection's close to its own client, then free the slot. Other centrals are untouched.
+        BluetoothPhoneAPI *api = apiForConn(connHandle);
+        if (api)
+            api->onTransportDisconnected();
+        bleSlots.release(connHandle);
 
-        if (bluetoothPhoneAPI) {
-            // Do NOT call close() here: this runs in the NimBLE task while the main task may be inside getFromRadio()
-            // holding packetForPhone. Ask the main task to close instead (see DISCONNECT notes in BluetoothPhoneAPI).
-            bluetoothPhoneAPI->fromPhone.disconnect();
-
-            bluetoothPhoneAPI->onReadCallbackIsWaitingForData = false;
-            { // scope for toPhoneMutex mutex
-                std::lock_guard<std::mutex> guard(bluetoothPhoneAPI->toPhoneMutex);
-                bluetoothPhoneAPI->toPhoneQueueSize = 0;
-            }
-
-            bluetoothPhoneAPI->readCount = 0;
-            bluetoothPhoneAPI->notifyCount = 0;
-            bluetoothPhoneAPI->writeCount = 0;
-
-            bluetoothPhoneAPI->setIntervalFromNow(0);
-            concurrency::mainDelay.interrupt(); // wake up main loop if sleeping
+        if (bleSlots.count() == 0) {
+            meshtastic::BluetoothStatus newStatus(meshtastic::BluetoothStatus::ConnectionState::DISCONNECTED);
+            bluetoothStatus->updateStatus(&newStatus);
         }
+        clearPairingDisplayUnlessStillNeeded(connHandle);
 
-        // Clear the last ToRadio packet buffer to avoid rejecting first packet from new connection
-        memset(lastToRadio, 0, sizeof(lastToRadio));
-
-        nimbleBluetoothConnHandle = BLE_HS_CONN_HANDLE_NONE; // BLE_HS_CONN_HANDLE_NONE means "no connection"
-
-#ifdef NIMBLE_TWO
         // Restart Advertising
-        ble->startAdvertising();
-#else
-        NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
-        if (!pAdvertising->start(0)) {
-            if (pAdvertising->isAdvertising()) {
-                LOG_DEBUG("BLE advertising already running");
-            } else {
-                LOG_ERROR("BLE failed to restart advertising");
-            }
-        }
-#endif
+        resumeAdvertising();
     }
 };
 
 static NimbleBluetoothToRadioCallback *toRadioCallbacks;
 static NimbleBluetoothFromRadioCallback *fromRadioCallbacks;
+#ifndef NIMBLE_TWO
+static NimbleBluetoothFromNumCallback *fromNumCallbacks;
+#endif
 
 void NimbleBluetooth::shutdown()
 {
@@ -808,13 +1021,13 @@ int NimbleBluetooth::getRssi()
         return 0; // No active BLE connection
     }
 
-    uint16_t connHandle = nimbleBluetoothConnHandle.load();
+    // Main task: read the slot table only. Never write a handle back: slots belong to the NimBLE task (see bleSlots).
+    uint16_t connHandle = bleSlots.firstConnectedHandle();
 
     if (connHandle == BLE_HS_CONN_HANDLE_NONE) {
         const auto peers = bleServer->getPeerDevices();
         if (!peers.empty()) {
-            connHandle = peers.front();
-            nimbleBluetoothConnHandle = connHandle;
+            connHandle = peers.front(); // local only
         }
     }
 
@@ -910,7 +1123,9 @@ void NimbleBluetooth::setupService()
             LOGRADIO_UUID,
             NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_AUTHEN | NIMBLE_PROPERTY::READ_ENC, 512U);
     }
-    bluetoothPhoneAPI = new BluetoothPhoneAPI();
+    // One client per slot, allocated up front on the main task (OSThreads must not be created from the NimBLE task).
+    for (uint8_t i = 0; i < MAX_BLE_PHONE_CLIENTS; i++)
+        bluetoothPhoneAPIs[i] = new BluetoothPhoneAPI(i);
 
     toRadioCallbacks = new NimbleBluetoothToRadioCallback();
     ToRadioCharacteristic->setCallbacks(toRadioCallbacks);
@@ -918,7 +1133,16 @@ void NimbleBluetooth::setupService()
     fromRadioCallbacks = new NimbleBluetoothFromRadioCallback();
     FromRadioCharacteristic->setCallbacks(fromRadioCallbacks);
 
+#ifndef NIMBLE_TWO
+    fromNumCallbacks = new NimbleBluetoothFromNumCallback();
+    fromNumCharacteristic->setCallbacks(fromNumCallbacks);
+#endif
+
     bleService->start();
+
+    // Until FromRadio long reads are made per connection, a second central could receive bytes spliced from another
+    // central's FromRadio: stay at one central.
+    bleSlots.setLimit(1);
 
     // Setup the battery service
     NimBLEService *batteryService = bleServer->createService(NimBLEUUID((uint16_t)0x180f)); // 0x180F is the Battery Service
