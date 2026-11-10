@@ -1,6 +1,11 @@
 #include "DebugConfiguration.h"
 #include "MeshService.h"
+#include "PhoneAPI.h"
+#include "SPILock.h"
 #include "TestUtil.h"
+#include "mesh-pb-constants.h"
+#include "xmodem.h"
+#include <cstring>
 #include <unity.h>
 
 namespace
@@ -233,6 +238,215 @@ void test_register_overflow_does_not_change_state_mask_or_existing_delivery(void
     TEST_ASSERT_NULL(meshService.getForPhone(overflowClient));
 }
 
+// 1b: BLE onDisconnect used to call PhoneAPI::close() on the NimBLE task while the main task held packetForPhone. The
+// close now runs on the main task, but MeshService must still tolerate the order "slot torn down, then the client's
+// late release of the packet it was holding" without freeing the payload twice, and a reconnect of the same PhoneAPI
+// must start clean.
+void test_close_from_other_context_then_late_release_is_safe(void)
+{
+    MeshService meshService;
+    DummyClientToken bleToken, uiToken;
+    PhoneAPI *bleClient = asClient(bleToken);
+    PhoneAPI *uiClient = asClient(uiToken);
+
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(bleClient, MeshService::STATE_BLE));
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(uiClient, MeshService::STATE_PACKET));
+
+    meshService.sendToPhone(allocDecodedPacket(601, 0x6001));
+    meshtastic_MeshPacket *held = meshService.getForPhone(bleClient); // "main task" is inside getFromRadio
+    TEST_ASSERT_NOT_NULL(held);
+
+    meshService.unregisterPhoneClient(bleClient);         // disconnect tears the slot down first
+    meshService.releaseToPoolForPhone(bleClient, held);  // late release: must be a no-op, not a double free
+    meshService.unregisterPhoneClient(bleClient);         // a second close is harmless too
+
+    // The other client still owns its reference to the shared payload.
+    meshtastic_MeshPacket *uiPacket = meshService.getForPhone(uiClient);
+    TEST_ASSERT_NOT_NULL(uiPacket);
+    TEST_ASSERT_EQUAL_UINT32(601, uiPacket->id);
+    meshService.releaseToPoolForPhone(uiClient, uiPacket);
+
+    // Reconnect of the same BLE PhoneAPI: no stale state, receives new traffic.
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(bleClient, MeshService::STATE_BLE));
+    TEST_ASSERT_NULL(meshService.getForPhone(bleClient));
+    meshService.sendToPhone(allocDecodedPacket(602, 0x6002));
+    meshtastic_MeshPacket *fresh = meshService.getForPhone(bleClient);
+    TEST_ASSERT_NOT_NULL(fresh);
+    TEST_ASSERT_EQUAL_UINT32(602, fresh->id);
+    meshService.releaseToPoolForPhone(bleClient, fresh);
+    meshtastic_MeshPacket *uiPacket2 = meshService.getForPhone(uiClient);
+    TEST_ASSERT_NOT_NULL(uiPacket2);
+    meshService.releaseToPoolForPhone(uiClient, uiPacket2);
+}
+
+// 2: a packet replayed from the store-and-forward history reaches every registered client, not just the first poller.
+void test_store_forward_packet_fanned_out_to_every_client(void)
+{
+    MeshService meshService;
+    DummyClientToken t1, t2, t3;
+    PhoneAPI *clients[] = {asClient(t1), asClient(t2), asClient(t3)};
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(clients[0], MeshService::STATE_PACKET));
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(clients[1], MeshService::STATE_BLE));
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(clients[2], MeshService::STATE_SERIAL));
+
+    TEST_ASSERT_TRUE(meshService.canAcceptStoreForwardPacket());
+    meshService.sendStoreForwardToPhone(allocDecodedPacket(701, NODENUM_BROADCAST));
+
+    for (auto *client : clients) {
+        meshtastic_MeshPacket *p = meshService.getForPhone(client);
+        TEST_ASSERT_NOT_NULL(p);
+        TEST_ASSERT_EQUAL_UINT32(701, p->id);
+        meshService.releaseToPoolForPhone(client, p);
+        TEST_ASSERT_NULL(meshService.getForPhone(client));
+    }
+}
+
+// 2: the S&F history is only drained while it can reach a client without displacing anything.
+void test_store_forward_gated_on_live_client_with_room(void)
+{
+    MeshService meshService;
+    TEST_ASSERT_FALSE(meshService.canAcceptStoreForwardPacket()); // nobody to deliver to: keep it in the history
+
+    DummyClientToken fastToken, fullToken;
+    PhoneAPI *fast = asClient(fastToken);
+    PhoneAPI *full = asClient(fullToken);
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(fast, MeshService::STATE_PACKET));
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(full, MeshService::STATE_BLE));
+
+    for (uint32_t i = 0; i < MAX_RX_TOPHONE; i++) {
+        TEST_ASSERT_TRUE(meshService.canAcceptStoreForwardPacket());
+        meshService.sendStoreForwardToPhone(allocDecodedPacket(800 + i, NODENUM_BROADCAST));
+        meshtastic_MeshPacket *p = meshService.getForPhone(fast);
+        TEST_ASSERT_NOT_NULL(p);
+        meshService.releaseToPoolForPhone(fast, p);
+    }
+    // `full` has not drained anything but is not stale yet: no more history may be pulled.
+    TEST_ASSERT_FALSE(meshService.canAcceptStoreForwardPacket());
+
+    meshtastic_MeshPacket *p = meshService.getForPhone(full);
+    TEST_ASSERT_NOT_NULL(p);
+    TEST_ASSERT_EQUAL_UINT32(800, p->id);
+    meshService.releaseToPoolForPhone(full, p);
+    TEST_ASSERT_TRUE(meshService.canAcceptStoreForwardPacket());
+
+    meshService.unregisterPhoneClient(full);
+    meshService.unregisterPhoneClient(fast);
+    TEST_ASSERT_FALSE(meshService.canAcceptStoreForwardPacket());
+}
+
+#ifdef FSCom
+static meshtastic_XModem xmodemControl(meshtastic_XModem_Control control, uint16_t seq = 0, const char *name = nullptr)
+{
+    meshtastic_XModem pkt = meshtastic_XModem_init_zero;
+    pkt.control = control;
+    pkt.seq = seq;
+    if (name) {
+        pkt.buffer.size = strlen(name) + 1;
+        memcpy(pkt.buffer.bytes, name, pkt.buffer.size);
+    }
+    return pkt;
+}
+
+// 3: responses are addressed to the client whose packet produced them.
+void test_xmodem_response_only_visible_to_requesting_client(void)
+{
+    XModemAdapter adapter;
+    DummyClientToken aToken, bToken;
+    PhoneAPI *a = asClient(aToken);
+    PhoneAPI *b = asClient(bToken);
+
+    // Download of a file that does not exist: immediate NAK for A, no transfer started.
+    TEST_ASSERT_TRUE(adapter.handlePacket(xmodemControl(meshtastic_XModem_Control_STX, 0, "/no/such/xmodem/file"), a));
+    TEST_ASSERT_FALSE(adapter.isBusy());
+
+    TEST_ASSERT_EQUAL(meshtastic_XModem_Control_NUL, adapter.getForPhone(b).control);
+    adapter.resetForPhone(b); // must not clear A's response
+    TEST_ASSERT_EQUAL(meshtastic_XModem_Control_NAK, adapter.getForPhone(a).control);
+    adapter.resetForPhone(a);
+    TEST_ASSERT_EQUAL(meshtastic_XModem_Control_NUL, adapter.getForPhone(a).control);
+}
+
+// 3: a running transfer belongs to the client that started it; disconnecting that client aborts it.
+void test_xmodem_transfer_bound_to_owner_and_aborted_on_close(void)
+{
+    XModemAdapter adapter;
+    DummyClientToken aToken, bToken;
+    PhoneAPI *a = asClient(aToken);
+    PhoneAPI *b = asClient(bToken);
+
+    TEST_ASSERT_TRUE(adapter.handlePacket(xmodemControl(meshtastic_XModem_Control_SOH, 0, "/xmodem_fanout_test.bin"), a));
+    if (!adapter.isBusy())
+        TEST_IGNORE_MESSAGE("filesystem not writable in this environment");
+    TEST_ASSERT_EQUAL_PTR(a, adapter.getTransferOwner());
+    TEST_ASSERT_EQUAL(meshtastic_XModem_Control_ACK, adapter.getForPhone(a).control);
+    adapter.resetForPhone(a);
+
+    // B cannot start, cancel or feed A's transfer.
+    TEST_ASSERT_FALSE(adapter.handlePacket(xmodemControl(meshtastic_XModem_Control_SOH, 0, "/other.bin"), b));
+    TEST_ASSERT_FALSE(adapter.handlePacket(xmodemControl(meshtastic_XModem_Control_CAN), b));
+    TEST_ASSERT_TRUE(adapter.isBusy());
+    TEST_ASSERT_EQUAL(meshtastic_XModem_Control_NUL, adapter.getForPhone(b).control);
+
+    adapter.abortFor(b); // not the owner: no effect
+    TEST_ASSERT_TRUE(adapter.isBusy());
+    adapter.abortFor(a); // owner disconnected
+    TEST_ASSERT_FALSE(adapter.isBusy());
+    TEST_ASSERT_NULL(adapter.getTransferOwner());
+
+    // Now B may start a transfer.
+    TEST_ASSERT_TRUE(adapter.handlePacket(xmodemControl(meshtastic_XModem_Control_STX, 0, "/no/such/xmodem/file"), b));
+    TEST_ASSERT_EQUAL(meshtastic_XModem_Control_NAK, adapter.getForPhone(b).control);
+}
+#endif
+
+class RejectedTestPhoneAPI : public PhoneAPI
+{
+  public:
+    RejectedTestPhoneAPI() { api_type = TYPE_SERIAL; }
+    void startConfig() { handleStartConfig(); }
+
+  protected:
+    bool checkIsConnected() override { return true; }
+};
+
+// 9: a client that cannot get a fanout slot is told so instead of hanging silently.
+void test_rejected_client_receives_error_notification(void)
+{
+    MeshService meshService;
+    MeshService *previousService = service;
+    service = &meshService;
+
+    DummyClientToken tokens[MAX_PHONE_API_CLIENTS];
+    for (int i = 0; i < MAX_PHONE_API_CLIENTS; i++)
+        TEST_ASSERT_TRUE(meshService.registerPhoneClient(asClient(tokens[i]), MeshService::STATE_PACKET));
+    const uint32_t maskBefore = meshService.api_state_mask;
+
+    {
+        RejectedTestPhoneAPI rejected;
+        rejected.startConfig();
+        TEST_ASSERT_FALSE(rejected.isConnected());
+        TEST_ASSERT_EQUAL_UINT32(maskBefore, meshService.api_state_mask);
+
+        TEST_ASSERT_TRUE(rejected.available());
+        uint8_t buf[meshtastic_FromRadio_size];
+        size_t len = rejected.getFromRadio(buf);
+        TEST_ASSERT_TRUE(len > 0u);
+
+        meshtastic_FromRadio fr = meshtastic_FromRadio_init_zero;
+        TEST_ASSERT_TRUE(pb_decode_from_bytes(buf, len, &meshtastic_FromRadio_msg, &fr));
+        TEST_ASSERT_EQUAL(meshtastic_FromRadio_clientNotification_tag, fr.which_payload_variant);
+        TEST_ASSERT_EQUAL(meshtastic_LogRecord_Level_ERROR, fr.clientNotification.level);
+        TEST_ASSERT_NOT_NULL(strstr(fr.clientNotification.message, "Too many clients"));
+
+        // Sent once; afterwards the client is simply not served until a slot frees up.
+        TEST_ASSERT_FALSE(rejected.available());
+        TEST_ASSERT_EQUAL_UINT32(0u, (uint32_t)rejected.getFromRadio(buf));
+    } // ~PhoneAPI -> close() must be safe for a never-registered client
+
+    TEST_ASSERT_EQUAL_UINT32(maskBefore, meshService.api_state_mask);
+    service = previousService;
+}
+
 } // namespace
 
 void setUp(void) {}
@@ -241,6 +455,8 @@ void tearDown(void) {}
 void setup()
 {
     initializeTestEnvironment();
+    if (!spiLock)
+        initSPI(); // xmodem file access takes the SPI lock
 
     UNITY_BEGIN();
     RUN_TEST(test_fanout_packet_delivered_to_all_active_clients_once);
@@ -250,6 +466,14 @@ void setup()
     RUN_TEST(test_api_state_mask_refcount_for_same_state_clients);
     RUN_TEST(test_fanout_pool_capacity_accounts_for_inflight_all_clients);
     RUN_TEST(test_register_overflow_does_not_change_state_mask_or_existing_delivery);
+    RUN_TEST(test_close_from_other_context_then_late_release_is_safe);
+    RUN_TEST(test_store_forward_packet_fanned_out_to_every_client);
+    RUN_TEST(test_store_forward_gated_on_live_client_with_room);
+#ifdef FSCom
+    RUN_TEST(test_xmodem_response_only_visible_to_requesting_client);
+    RUN_TEST(test_xmodem_transfer_bound_to_owner_and_aborted_on_close);
+#endif
+    RUN_TEST(test_rejected_client_receives_error_notification);
     exit(UNITY_END());
 }
 
