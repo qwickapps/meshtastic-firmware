@@ -4,6 +4,8 @@
 #include "PhoneAPI.h"
 #include "Router.h"
 #include "SPILock.h"
+#include "BlePairingPinOwner.h"
+#include "BleSlotTable.h"
 #include "SessionHandoffQueue.h"
 #include "TestUtil.h"
 #include "concurrency/LockGuard.h"
@@ -13,6 +15,8 @@
 #include <cstring>
 #include <unity.h>
 #include <vector>
+
+extern bool pauseBluetoothLogging; // main.cpp
 
 class MeshServiceTestAccess
 {
@@ -573,6 +577,51 @@ void test_ble_reconnect_before_runonce_closes_old_session_first(void)
     service = previousService;
 }
 
+// Multi-BLE: BLE log notifies stay paused while ANY client is downloading its config. One client reaching steady state
+// (or polling in it) must not resume them for another client that is still mid-config.
+void test_ble_log_pause_held_while_any_client_in_config(void)
+{
+    MeshService meshService;
+    MeshService *previousService = service;
+    service = &meshService;
+    pauseBluetoothLogging = false;
+
+    {
+        HandoffTestPhoneAPI a, b;
+        a.writeWantConfig(1);
+        a.runOnce();
+        TEST_ASSERT_TRUE(pauseBluetoothLogging);
+        b.writeWantConfig(2);
+        b.runOnce();
+        TEST_ASSERT_TRUE(pauseBluetoothLogging);
+
+        a.sendConfigComplete();
+        TEST_ASSERT_TRUE(a.isSendingPackets());
+        TEST_ASSERT_TRUE(pauseBluetoothLogging); // b is still in config
+        uint8_t buf[meshtastic_FromRadio_size];
+        a.getFromRadio(buf); // steady-state poll by a
+        TEST_ASSERT_TRUE(pauseBluetoothLogging);
+
+        b.close(); // b leaves mid-config
+        TEST_ASSERT_FALSE(pauseBluetoothLogging);
+
+        a.writeWantConfig(3); // a re-requests config: counted once, released once
+        a.runOnce();
+        a.writeWantConfig(4);
+        a.runOnce();
+        TEST_ASSERT_TRUE(pauseBluetoothLogging);
+        a.sendConfigComplete();
+        TEST_ASSERT_FALSE(pauseBluetoothLogging);
+
+        a.writeWantConfig(5);
+        a.runOnce();
+        TEST_ASSERT_TRUE(pauseBluetoothLogging);
+    } // ~PhoneAPI closes a while in config
+
+    TEST_ASSERT_FALSE(pauseBluetoothLogging);
+    service = previousService;
+}
+
 // 5: writes beyond the queue depth are refused, not overwritten, and the disconnect drops queued writes.
 void test_session_handoff_queue_bounds_and_disconnect(void)
 {
@@ -593,6 +642,69 @@ void test_session_handoff_queue_bounds_and_disconnect(void)
     TEST_ASSERT_FALSE(r.havePacket);
     r = q.pop(v);
     TEST_ASSERT_FALSE(r.closeFirst);
+}
+
+// Multi-BLE: each connection handle gets its own slot, a full table refuses further centrals, a freed slot is reused,
+// and readers never claim. A limit of 1 keeps the single-central behaviour.
+void test_ble_slot_table_claim_release_and_limit(void)
+{
+    BleSlotTable<3> t;
+    TEST_ASSERT_EQUAL_UINT32(0u, (uint32_t)t.count());
+    TEST_ASSERT_EQUAL_UINT16(BleSlotTable<3>::kNoHandle, t.firstConnectedHandle());
+
+    TEST_ASSERT_EQUAL_INT(0, t.claim(5));
+    TEST_ASSERT_EQUAL_INT(1, t.claim(7));
+    TEST_ASSERT_EQUAL_INT(0, t.claim(5)); // same handle, same slot
+    TEST_ASSERT_EQUAL_INT(2, t.claim(9));
+    TEST_ASSERT_TRUE(t.full());
+    TEST_ASSERT_EQUAL_INT(-1, t.claim(11));
+
+    TEST_ASSERT_EQUAL_INT(1, t.release(7));
+    TEST_ASSERT_EQUAL_INT(-1, t.find(7));
+    TEST_ASSERT_EQUAL_INT(-1, t.release(7)); // released once
+    TEST_ASSERT_FALSE(t.full());
+    TEST_ASSERT_EQUAL_INT(1, t.claim(11));
+    TEST_ASSERT_EQUAL_UINT16(5, t.firstConnectedHandle());
+    TEST_ASSERT_EQUAL_INT(-1, t.claim(BleSlotTable<3>::kNoHandle));
+
+    BleSlotTable<3> single;
+    single.setLimit(1);
+    TEST_ASSERT_EQUAL_INT(0, single.claim(1));
+    TEST_ASSERT_TRUE(single.full());
+    TEST_ASSERT_EQUAL_INT(-1, single.claim(2));
+    single.setLimit(0);
+    TEST_ASSERT_EQUAL_UINT32(1u, (uint32_t)single.usable());
+    single.setLimit(9);
+    TEST_ASSERT_EQUAL_UINT32(3u, (uint32_t)single.usable());
+}
+
+// Multi-BLE pairing: the PIN on screen belongs to one connection. Another live connection is refused instead of sharing
+// it, and the PIN comes off screen when its own connection finishes, whatever other (unencrypted) links are up.
+void test_ble_pairing_pin_owner(void)
+{
+    BlePairingPinOwner p;
+    const uint16_t none = BlePairingPinOwner::kNoHandle;
+    TEST_ASSERT_FALSE(p.showing());
+    TEST_ASSERT_FALSE(p.heldByOther(5, true));
+    TEST_ASSERT_FALSE(p.release(5));
+
+    p.show(5);
+    TEST_ASSERT_TRUE(p.showing());
+    TEST_ASSERT_FALSE(p.heldByOther(5, true)); // owner re-pairing gets a new PIN
+    TEST_ASSERT_TRUE(p.heldByOther(7, true));
+    TEST_ASSERT_FALSE(p.heldByOther(7, false)); // owner gone
+    TEST_ASSERT_FALSE(p.release(7));            // an unrelated link finishing or leaving keeps the owner's PIN
+    TEST_ASSERT_TRUE(p.showing());
+    TEST_ASSERT_TRUE(p.release(5)); // owner done (success or failure): PIN off screen
+    TEST_ASSERT_FALSE(p.showing());
+    TEST_ASSERT_EQUAL_UINT16(none, p.owner());
+    TEST_ASSERT_FALSE(p.heldByOther(7, true));
+
+    // Unknown owner (single-central builds): any connection finishing clears, nobody is refused.
+    p.show(none);
+    TEST_ASSERT_FALSE(p.heldByOther(7, true));
+    TEST_ASSERT_TRUE(p.release(7));
+    TEST_ASSERT_FALSE(p.showing());
 }
 
 // 2: a packet replayed from the store-and-forward history reaches every registered client, not just the first poller.
@@ -1018,6 +1130,9 @@ void setup()
     RUN_TEST(test_client_sent_packet_reaches_other_clients_only);
     RUN_TEST(test_ble_reconnect_before_runonce_closes_old_session_first);
     RUN_TEST(test_session_handoff_queue_bounds_and_disconnect);
+    RUN_TEST(test_ble_slot_table_claim_release_and_limit);
+    RUN_TEST(test_ble_pairing_pin_owner);
+    RUN_TEST(test_ble_log_pause_held_while_any_client_in_config);
     RUN_TEST(test_store_forward_packet_fanned_out_to_every_client);
     RUN_TEST(test_store_forward_gated_on_live_client_with_room);
 #if !MESHTASTIC_EXCLUDE_STOREFORWARD
