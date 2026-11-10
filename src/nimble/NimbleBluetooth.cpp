@@ -74,6 +74,7 @@ NimBLECharacteristic *logRadioCharacteristic;
 NimBLEServer *bleServer;
 
 static bool passkeyShowing;
+static uint32_t shownPasskey; // the PIN on screen while passkeyShowing (NimBLE host task only)
 
 // Connection handle -> client slot. Claimed / released only on the NimBLE host task; other tasks only read it.
 static BleSlotTable<MAX_BLE_PHONE_CLIENTS> bleSlots;
@@ -886,6 +887,13 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
         uint32_t passkey = config.bluetooth.fixed_pin;
 
         if (config.bluetooth.mode == meshtastic_Config_BluetoothConfig_PairingMode_RANDOM_PIN) {
+            if (passkeyShowing) {
+                // Another central is pairing with the PIN on screen. Give this one the same PIN: a new one would replace the
+                // alert and the BluetoothStatus PIN, and the first central's user could no longer complete pairing.
+                LOG_INFO("Reuse the random passkey on screen for another pairing central");
+                powerFSM.trigger(EVENT_BLUETOOTH_PAIR);
+                return shownPasskey;
+            }
             LOG_INFO("Use random passkey");
             // This is the passkey to be entered on peer - we pick a number >100,000 to ensure 6 digits
             passkey = random(100000, 999999);
@@ -925,6 +933,7 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
             });
         }
 #endif
+        shownPasskey = passkey;
         passkeyShowing = true;
 
         return passkey;
