@@ -176,7 +176,7 @@ class MeshService
     void releaseMqttProxyFanoutEntryLocked(MqttProxyFanoutEntry *entry);
     void releaseClientNotificationFanoutEntryLocked(ClientNotificationFanoutEntry *entry);
 
-    bool enqueuePacketFanoutLocked(meshtastic_MeshPacket *p);
+    bool enqueuePacketFanoutLocked(meshtastic_MeshPacket *p, const PhoneAPI *exclude = nullptr);
     void enqueueToPhoneClients(meshtastic_MeshPacket *p);
     bool enqueueQueueStatusFanoutLocked(meshtastic_QueueStatus *qs);
     bool enqueueMqttProxyFanoutLocked(meshtastic_MqttClientProxyMessage *m);
@@ -251,7 +251,18 @@ class MeshService
      * Called by PhoneAPI.handleToRadio.  Note: p is a scratch buffer, this function is allowed to write to it but it can not keep
      * a reference
      */
-    void handleToRadio(meshtastic_MeshPacket &p);
+    void handleToRadio(meshtastic_MeshPacket &p, const PhoneAPI *origin = nullptr);
+
+    /// Packets a client sends that the other connected clients should show too (chat, alerts, waypoints).
+    static bool isSharedWithOtherClients(const meshtastic_MeshPacket *p)
+    {
+        return p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
+               (p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP || p->decoded.portnum == meshtastic_PortNum_ALERT_APP ||
+                p->decoded.portnum == meshtastic_PortNum_WAYPOINT_APP);
+    }
+
+    /// Fan a packet sent by one client out to every other registered client (takes ownership of p).
+    void sendToOtherPhones(meshtastic_MeshPacket *p, const PhoneAPI *origin);
 
     /** The radioConfig object just changed, call this to force the hw to change to the new settings
      * @return true if client devices should be sent a new set of radio configs
@@ -269,7 +280,7 @@ class MeshService
     /// Send a packet into the mesh - note p must have been allocated from packetPool.  We will return it to that pool after
     /// sending. This is the ONLY function you should use for sending messages into the mesh, because it also updates the nodedb
     /// cache
-    void sendToMesh(meshtastic_MeshPacket *p, RxSource src = RX_SRC_LOCAL, bool ccToPhone = false);
+    ErrorCode sendToMesh(meshtastic_MeshPacket *p, RxSource src = RX_SRC_LOCAL, bool ccToPhone = false);
 
     /** Attempt to cancel a previously sent packet from this _local_ node.  Returns true if a packet was found we could cancel */
     bool cancelSending(PacketId id);

@@ -904,7 +904,7 @@ bool PhoneAPI::handleToRadioPacket(meshtastic_MeshPacket &p)
     }
 
     lastPortNumToRadio[p.decoded.portnum] = millis();
-    service->handleToRadio(p);
+    service->handleToRadio(p, this);
     return true;
 }
 

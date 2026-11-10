@@ -463,6 +463,46 @@ void test_stale_client_suspended_and_released_until_it_reads(void)
     expectDrainOrder(meshService, live, fifth, 1);
 }
 
+// 6: what one client sends reaches the other clients (touchscreen <-> phone), never the sender itself.
+void test_client_sent_packet_reaches_other_clients_only(void)
+{
+    MeshService meshService;
+    DummyClientToken uiToken, phoneToken, serialToken;
+    PhoneAPI *ui = asClient(uiToken);
+    PhoneAPI *phone = asClient(phoneToken);
+    PhoneAPI *serial = asClient(serialToken);
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(ui, MeshService::STATE_PACKET));
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(phone, MeshService::STATE_BLE));
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(serial, MeshService::STATE_SERIAL));
+
+    meshService.sendToOtherPhones(allocDecodedPacket(1201, NODENUM_BROADCAST), phone);
+    const uint32_t ids[] = {1201};
+    expectDrainOrder(meshService, ui, ids, 1);
+    expectDrainOrder(meshService, serial, ids, 1);
+    TEST_ASSERT_NULL(meshService.getForPhone(phone));
+
+    // Only the sender connected: nothing is queued, nothing leaks into the detached backlog.
+    meshService.unregisterPhoneClient(ui);
+    meshService.unregisterPhoneClient(serial);
+    meshService.sendToOtherPhones(allocDecodedPacket(1202, NODENUM_BROADCAST), phone);
+    TEST_ASSERT_NULL(meshService.getForPhone(phone));
+    meshService.unregisterPhoneClient(phone);
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(ui, MeshService::STATE_PACKET));
+    TEST_ASSERT_NULL(meshService.getForPhone(ui));
+
+    // Chat-like packets are shared; admin and other app traffic is not.
+    meshtastic_MeshPacket p = meshtastic_MeshPacket_init_zero;
+    p.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    p.decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+    TEST_ASSERT_TRUE(MeshService::isSharedWithOtherClients(&p));
+    p.decoded.portnum = meshtastic_PortNum_WAYPOINT_APP;
+    TEST_ASSERT_TRUE(MeshService::isSharedWithOtherClients(&p));
+    p.decoded.portnum = meshtastic_PortNum_ADMIN_APP;
+    TEST_ASSERT_FALSE(MeshService::isSharedWithOtherClients(&p));
+    p.decoded.portnum = meshtastic_PortNum_POSITION_APP;
+    TEST_ASSERT_FALSE(MeshService::isSharedWithOtherClients(&p));
+}
+
 // 2: a packet replayed from the store-and-forward history reaches every registered client, not just the first poller.
 void test_store_forward_packet_fanned_out_to_every_client(void)
 {
@@ -777,6 +817,7 @@ void setup()
     RUN_TEST(test_full_queue_evicts_oldest_non_text_first);
     RUN_TEST(test_full_detached_backlog_evicts_oldest_non_text_first);
     RUN_TEST(test_stale_client_suspended_and_released_until_it_reads);
+    RUN_TEST(test_client_sent_packet_reaches_other_clients_only);
     RUN_TEST(test_store_forward_packet_fanned_out_to_every_client);
     RUN_TEST(test_store_forward_gated_on_live_client_with_room);
 #if !MESHTASTIC_EXCLUDE_STOREFORWARD

@@ -338,7 +338,7 @@ void MeshService::updateApiStateLocked(APIState preferred)
     api_state = STATE_DISCONNECTED;
 }
 
-bool MeshService::enqueuePacketFanoutLocked(meshtastic_MeshPacket *p)
+bool MeshService::enqueuePacketFanoutLocked(meshtastic_MeshPacket *p, const PhoneAPI *exclude)
 {
     if (!p)
         return false;
@@ -356,7 +356,7 @@ bool MeshService::enqueuePacketFanoutLocked(meshtastic_MeshPacket *p)
     bool delivered = false;
     for (int i = 0; i < MAX_PHONE_API_CLIENTS; i++) {
         auto &slot = phoneClients[i];
-        if (!slot.active)
+        if (!slot.active || (exclude && slot.client == exclude))
             continue;
 
         suspendIfStaleLocked(slot, i);
@@ -900,7 +900,7 @@ NodeNum MeshService::getNodenumFromRequestId(uint32_t request_id)
  * Called by PhoneAPI.handleToRadio.  Note: p is a scratch buffer, this function is allowed to write to it but it can not keep a
  * reference
  */
-void MeshService::handleToRadio(meshtastic_MeshPacket &p)
+void MeshService::handleToRadio(meshtastic_MeshPacket &p, const PhoneAPI *origin)
 {
 #if defined(ARCH_PORTDUINO)
     if (SimRadio::instance && p.decoded.portnum == meshtastic_PortNum_SIMULATOR_APP) {
@@ -929,7 +929,17 @@ void MeshService::handleToRadio(meshtastic_MeshPacket &p)
     DEBUG_HEAP_BEFORE;
     auto a = packetPool.allocCopy(p);
     DEBUG_HEAP_AFTER("MeshService::handleToRadio", a);
-    sendToMesh(a, RX_SRC_USER);
+    // Copy before sending: the router may release or encrypt `a`.
+    meshtastic_MeshPacket *echo = (origin && isSharedWithOtherClients(&p)) ? packetPool.allocCopy(p) : nullptr;
+    ErrorCode res = sendToMesh(a, RX_SRC_USER);
+    if (echo) {
+        if (res == ERRNO_OK || res == ERRNO_SHOULD_RELEASE) {
+            echo->from = nodeDB->getNodeNum();
+            sendToOtherPhones(echo, origin);
+        } else {
+            releaseToPool(echo);
+        }
+    }
 
     bool loopback = false; // if true send any packet the phone sends back itself (for testing)
     if (loopback) {
@@ -971,7 +981,7 @@ ErrorCode MeshService::sendQueueStatusToPhone(const meshtastic_QueueStatus &qs, 
     return ERRNO_UNKNOWN;
 }
 
-void MeshService::sendToMesh(meshtastic_MeshPacket *p, RxSource src, bool ccToPhone)
+ErrorCode MeshService::sendToMesh(meshtastic_MeshPacket *p, RxSource src, bool ccToPhone)
 {
     uint32_t mesh_packet_id = p->id;
     nodeDB->updateFrom(*p); // update our local DB for this packet (because phone might have sent position packets etc...)
@@ -999,6 +1009,7 @@ void MeshService::sendToMesh(meshtastic_MeshPacket *p, RxSource src, bool ccToPh
     if (res == ERRNO_SHOULD_RELEASE) {
         releaseToPool(p);
     }
+    return res;
 }
 
 bool MeshService::trySendPosition(NodeNum dest, bool wantReplies)
@@ -1055,6 +1066,24 @@ void MeshService::sendStoreForwardToPhone(meshtastic_MeshPacket *p)
         return;
     perhapsDecode(p);
     enqueueToPhoneClients(p);
+}
+
+void MeshService::sendToOtherPhones(meshtastic_MeshPacket *p, const PhoneAPI *origin)
+{
+    if (!p)
+        return;
+    bool delivered = false;
+    {
+        concurrency::LockGuard guard(&phoneClientsLock);
+        // Unlike received packets this never goes to the detached backlog: the sender itself saw it.
+        if (api_state_mask == 0) {
+            releaseToPool(p);
+            return;
+        }
+        delivered = enqueuePacketFanoutLocked(p, origin);
+    }
+    if (delivered)
+        fromNum++;
 }
 
 bool MeshService::canAcceptStoreForwardPacket()
