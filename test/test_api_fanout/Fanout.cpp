@@ -15,6 +15,8 @@
 #include <unity.h>
 #include <vector>
 
+extern bool pauseBluetoothLogging; // main.cpp
+
 class MeshServiceTestAccess
 {
   public:
@@ -574,6 +576,51 @@ void test_ble_reconnect_before_runonce_closes_old_session_first(void)
     service = previousService;
 }
 
+// Multi-BLE: BLE log notifies stay paused while ANY client is downloading its config. One client reaching steady state
+// (or polling in it) must not resume them for another client that is still mid-config.
+void test_ble_log_pause_held_while_any_client_in_config(void)
+{
+    MeshService meshService;
+    MeshService *previousService = service;
+    service = &meshService;
+    pauseBluetoothLogging = false;
+
+    {
+        HandoffTestPhoneAPI a, b;
+        a.writeWantConfig(1);
+        a.runOnce();
+        TEST_ASSERT_TRUE(pauseBluetoothLogging);
+        b.writeWantConfig(2);
+        b.runOnce();
+        TEST_ASSERT_TRUE(pauseBluetoothLogging);
+
+        a.sendConfigComplete();
+        TEST_ASSERT_TRUE(a.isSendingPackets());
+        TEST_ASSERT_TRUE(pauseBluetoothLogging); // b is still in config
+        uint8_t buf[meshtastic_FromRadio_size];
+        a.getFromRadio(buf); // steady-state poll by a
+        TEST_ASSERT_TRUE(pauseBluetoothLogging);
+
+        b.close(); // b leaves mid-config
+        TEST_ASSERT_FALSE(pauseBluetoothLogging);
+
+        a.writeWantConfig(3); // a re-requests config: counted once, released once
+        a.runOnce();
+        a.writeWantConfig(4);
+        a.runOnce();
+        TEST_ASSERT_TRUE(pauseBluetoothLogging);
+        a.sendConfigComplete();
+        TEST_ASSERT_FALSE(pauseBluetoothLogging);
+
+        a.writeWantConfig(5);
+        a.runOnce();
+        TEST_ASSERT_TRUE(pauseBluetoothLogging);
+    } // ~PhoneAPI closes a while in config
+
+    TEST_ASSERT_FALSE(pauseBluetoothLogging);
+    service = previousService;
+}
+
 // 5: writes beyond the queue depth are refused, not overwritten, and the disconnect drops queued writes.
 void test_session_handoff_queue_bounds_and_disconnect(void)
 {
@@ -1054,6 +1101,7 @@ void setup()
     RUN_TEST(test_ble_reconnect_before_runonce_closes_old_session_first);
     RUN_TEST(test_session_handoff_queue_bounds_and_disconnect);
     RUN_TEST(test_ble_slot_table_claim_release_and_limit);
+    RUN_TEST(test_ble_log_pause_held_while_any_client_in_config);
     RUN_TEST(test_store_forward_packet_fanned_out_to_every_client);
     RUN_TEST(test_store_forward_gated_on_live_client_with_room);
 #if !MESHTASTIC_EXCLUDE_STOREFORWARD

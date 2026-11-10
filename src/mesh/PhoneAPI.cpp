@@ -47,6 +47,24 @@ void releaseFilesManifest(std::vector<meshtastic_FileInfo> &filesManifest)
 }
 } // namespace
 
+namespace
+{
+// Clients currently downloading their config (main task only).
+uint8_t clientsPausingBluetoothLogging = 0;
+} // namespace
+
+void PhoneAPI::setPausesBluetoothLogging(bool pause)
+{
+    if (pause == pausesBluetoothLogging)
+        return;
+    pausesBluetoothLogging = pause;
+    if (pause)
+        clientsPausingBluetoothLogging++;
+    else if (clientsPausingBluetoothLogging > 0)
+        clientsPausingBluetoothLogging--;
+    pauseBluetoothLogging = clientsPausingBluetoothLogging > 0;
+}
+
 PhoneAPI::PhoneAPI()
 {
     lastContactMsec = millis();
@@ -120,7 +138,7 @@ void PhoneAPI::handleStartConfig()
     } else {
         state = STATE_SEND_MY_INFO;
     }
-    pauseBluetoothLogging = true;
+    setPausesBluetoothLogging(true);
     // Manifest is never read on the node-info-only path (STATE_SEND_FILEMANIFEST
     // short-circuits to sendConfigComplete), so skip the SPI lock + FS walk.
     if (config_nonce != SPECIAL_NONCE_ONLY_NODES) {
@@ -180,7 +198,6 @@ void PhoneAPI::close()
         fromRadioNum = 0;
         config_nonce = 0;
         config_state = 0;
-        pauseBluetoothLogging = false;
         heartbeatReceived = false;
     } else {
         service->unregisterPhoneClient(this);
@@ -191,6 +208,7 @@ void PhoneAPI::close()
     xmodemPacketForPhone = meshtastic_XModem_init_zero;
 #endif
     registrationRejected = false;
+    setPausesBluetoothLogging(false);
 }
 
 bool PhoneAPI::checkConnectionTimeout()
@@ -504,7 +522,7 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
         break;
 
     case STATE_SEND_PACKETS:
-        pauseBluetoothLogging = false;
+        setPausesBluetoothLogging(false); // normally already released by sendConfigComplete()
         // Do we have a message from the mesh or packet from the local device?
         LOG_DEBUG("FromRadio=STATE_SEND_PACKETS");
         if (queueStatusPacketForPhone) {
@@ -749,7 +767,7 @@ void PhoneAPI::sendConfigComplete()
     // Allow subclasses to know we've entered steady-state so they can lower power consumption
     onConfigComplete();
 
-    pauseBluetoothLogging = false;
+    setPausesBluetoothLogging(false);
 }
 
 void PhoneAPI::releasePhonePacket()

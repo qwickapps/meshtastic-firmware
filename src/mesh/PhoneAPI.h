@@ -105,6 +105,13 @@ class PhoneAPI
 
     void resetReadIndex() { readIndex = 0; }
 
+    /// True while this client is counted as downloading its config (see setPausesBluetoothLogging).
+    bool pausesBluetoothLogging = false;
+
+    /// Main task. The process-wide pauseBluetoothLogging holds while ANY client is in its config download, so one client
+    /// reaching STATE_SEND_PACKETS can no longer resume BLE log notifies for another client that is still mid-config.
+    void setPausesBluetoothLogging(bool pause);
+
   public:
     PhoneAPI();
 
