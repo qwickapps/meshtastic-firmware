@@ -57,6 +57,38 @@ class MeshService
         return (s == STATE_DISCONNECTED) ? 0u : (1u << (static_cast<uint32_t>(s) - 1u));
     }
 
+    /**
+     * Config coherence: the local settings sections an admin request changed. Every other registered phone client is
+     * told to re-send these sections, so the MUI and BLE/serial/WiFi apps never show stale settings. A set of dirty
+     * bits per client (not a queue): repeated changes coalesce and the current value is read when the client sends it.
+     */
+    struct ConfigSyncSet {
+        uint32_t config = 0;       ///< bit (1u << meshtastic_Config_*_tag)
+        uint32_t moduleConfig = 0; ///< bit (1u << meshtastic_ModuleConfig_*_tag)
+        uint32_t channels = 0;     ///< bit (1u << channel index)
+        bool owner = false;        ///< our own User record (sent as our NodeInfo)
+
+        bool any() const { return config || moduleConfig || channels || owner; }
+        void merge(const ConfigSyncSet &o)
+        {
+            config |= o.config;
+            moduleConfig |= o.moduleConfig;
+            channels |= o.channels;
+            owner = owner || o.owner;
+        }
+        void clear() { *this = ConfigSyncSet(); }
+    };
+
+    /// One section a phone client still has to re-send, taken by PhoneAPI when it builds its next FromRadio
+    struct ConfigSyncItem {
+        enum Kind : uint8_t { NONE, CONFIG, MODULE_CONFIG, CHANNEL, OWNER };
+        Kind kind = NONE;
+        uint8_t index = 0; ///< config / module config payload tag, or channel index
+    };
+
+    /// Max admin request ids remembered to find which phone client sent a request (see noteAdminRequestOrigin)
+    static constexpr int kAdminOriginSlots = 8;
+
   private:
 #if HAS_GPS
     CallbackObserver<MeshService, const meshtastic::GPSStatus *> gpsObserver =
@@ -90,6 +122,8 @@ class MeshService
         /// Stale client whose queued packets were released; gets no packets until it reads again.
         bool suspended = false;
         uint32_t lastDrainMsec = 0;
+        /// Connection id, unique per registration (PhoneAPI objects such as the BLE one are reused across connections)
+        uint32_t connectionId = 0;
 
 #if defined(ARCH_PORTDUINO)
         PointerQueue<PacketFanoutEntry> packetQueue;
@@ -102,6 +136,9 @@ class MeshService
         StaticPointerQueue<MqttProxyFanoutEntry, MAX_RX_MQTTPROXY_TOPHONE> mqttProxyQueue;
         StaticPointerQueue<ClientNotificationFanoutEntry, MAX_RX_NOTIFICATION_TOPHONE> clientNotificationQueue;
 #endif
+
+        /// Config sections this client still has to re-send (config coherence)
+        ConfigSyncSet pendingConfigSync;
 
         PacketFanoutEntry *packetInflight = nullptr;
         QueueStatusFanoutEntry *queueStatusInflight = nullptr;
@@ -147,6 +184,19 @@ class MeshService
 
     /// Per APIState connected client counts
     uint8_t apiStateCounts[STATE_ETH + 1] = {0};
+
+    /// Ring of recent local admin request ids and the phone client that sent each one (protected by phoneClientsLock)
+    struct AdminRequestOrigin {
+        PacketId id = 0;
+        const PhoneAPI *client = nullptr;
+    };
+    AdminRequestOrigin adminOrigins[kAdminOriginSlots];
+    uint8_t adminOriginNext = 0;
+
+    /// Last PhoneClientSlot::connectionId handed out (protected by phoneClientsLock)
+    uint32_t lastConnectionId = 0;
+
+    const PhoneAPI *findAdminRequestOriginLocked(PacketId id) const;
 
     // This holds the last QueueStatus send
     meshtastic_QueueStatus lastQueueStatus;
@@ -210,6 +260,30 @@ class MeshService
 
     bool registerPhoneClient(PhoneAPI *client, APIState state);
     void unregisterPhoneClient(PhoneAPI *client);
+
+    /// Remember that phone client `client` sent the local admin request with packet id `id`
+    void noteAdminRequestOrigin(PacketId id, const PhoneAPI *client);
+
+    /// The phone client that sent local admin request `id` (see noteAdminRequestOrigin), nullptr if unknown
+    const PhoneAPI *getAdminRequestOrigin(PacketId id);
+
+    /**
+     * Id of `client`'s current connection, 0 if it is not registered. A new connection of the same PhoneAPI object gets a
+     * new id, so a stored (client, id) pair tells whether that connection is still up.
+     */
+    uint32_t getPhoneConnectionId(const PhoneAPI *client);
+
+    /**
+     * Config coherence: mark `changed` as pending on every registered phone client except the one that sent admin request
+     * `requestId` (0 = no requester to skip, e.g. remote admin). Returns the number of clients marked.
+     */
+    int pushConfigToOtherPhoneClients(const ConfigSyncSet &changed, PacketId requestId);
+
+    /// True if `client` has config sections to re-send
+    bool hasPendingConfigForPhone(PhoneAPI *client);
+
+    /// Take the next config section `client` has to re-send. Returns false when there is none.
+    bool takePendingConfigForPhone(PhoneAPI *client, ConfigSyncItem &item);
 
     /// Return the next packet destined to the specified phone client.
     meshtastic_MeshPacket *getForPhone(PhoneAPI *client);

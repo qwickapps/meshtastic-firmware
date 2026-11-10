@@ -24,8 +24,9 @@ PacketAPI::PacketAPI(PacketServer *_server)
 
 int32_t PacketAPI::runOnce()
 {
-    // The touchscreen is served like any other phone client, also while Bluetooth is enabled: MUI and BLE phones
-    // receive every packet concurrently. device-ui enters programming mode only on explicit user request.
+    // The touchscreen is a full PhoneAPI client, served also while Bluetooth is enabled: MUI and BLE phones receive
+    // every packet concurrently through the per-client fan-out queues. device-ui enters programming mode only on
+    // explicit user request.
     bool success = sendPacket();
     success |= receivePacket();
     return success ? 10 : 50;

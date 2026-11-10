@@ -885,6 +885,112 @@ void test_rejected_client_receives_error_notification(void)
     service = previousService;
 }
 
+static int drainConfigSync(MeshService &meshService, PhoneAPI *client, MeshService::ConfigSyncItem *items, int maxItems)
+{
+    int n = 0;
+    MeshService::ConfigSyncItem item;
+    while (n < maxItems && meshService.takePendingConfigForPhone(client, item)) {
+        items[n++] = item;
+    }
+    return n;
+}
+
+void test_config_sync_skips_requester_and_reaches_other_clients(void)
+{
+    MeshService meshService;
+    DummyClientToken t1, t2, t3;
+    PhoneAPI *mui = asClient(t1);
+    PhoneAPI *ble = asClient(t2);
+    PhoneAPI *serial = asClient(t3);
+
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(mui, MeshService::STATE_PACKET));
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(ble, MeshService::STATE_BLE));
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(serial, MeshService::STATE_SERIAL));
+
+    meshService.noteAdminRequestOrigin(0x1234, mui);
+
+    MeshService::ConfigSyncSet changed;
+    changed.config = (1u << meshtastic_Config_bluetooth_tag) | (1u << meshtastic_Config_lora_tag);
+    changed.channels = 1u << 2;
+    changed.owner = true;
+    TEST_ASSERT_EQUAL_INT(2, meshService.pushConfigToOtherPhoneClients(changed, 0x1234));
+
+    TEST_ASSERT_FALSE(meshService.hasPendingConfigForPhone(mui));
+    TEST_ASSERT_TRUE(meshService.hasPendingConfigForPhone(ble));
+    TEST_ASSERT_TRUE(meshService.hasPendingConfigForPhone(serial));
+
+    PhoneAPI *others[] = {ble, serial};
+    for (PhoneAPI *client : others) {
+        MeshService::ConfigSyncItem items[8];
+        TEST_ASSERT_EQUAL_INT(4, drainConfigSync(meshService, client, items, 8));
+        // same order as the initial config download: owner, channels, config (by tag)
+        TEST_ASSERT_EQUAL_UINT8(MeshService::ConfigSyncItem::OWNER, items[0].kind);
+        TEST_ASSERT_EQUAL_UINT8(MeshService::ConfigSyncItem::CHANNEL, items[1].kind);
+        TEST_ASSERT_EQUAL_UINT8(2, items[1].index);
+        TEST_ASSERT_EQUAL_UINT8(MeshService::ConfigSyncItem::CONFIG, items[2].kind);
+        TEST_ASSERT_EQUAL_UINT8(meshtastic_Config_lora_tag, items[2].index);
+        TEST_ASSERT_EQUAL_UINT8(MeshService::ConfigSyncItem::CONFIG, items[3].kind);
+        TEST_ASSERT_EQUAL_UINT8(meshtastic_Config_bluetooth_tag, items[3].index);
+        TEST_ASSERT_FALSE(meshService.hasPendingConfigForPhone(client));
+    }
+
+    MeshService::ConfigSyncItem item;
+    TEST_ASSERT_FALSE(meshService.takePendingConfigForPhone(mui, item));
+}
+
+void test_config_sync_unknown_requester_reaches_all_and_coalesces(void)
+{
+    MeshService meshService;
+    DummyClientToken t1, t2;
+    PhoneAPI *mui = asClient(t1);
+    PhoneAPI *ble = asClient(t2);
+
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(mui, MeshService::STATE_PACKET));
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(ble, MeshService::STATE_BLE));
+
+    MeshService::ConfigSyncSet changed;
+    changed.moduleConfig = 1u << meshtastic_ModuleConfig_mqtt_tag;
+
+    // remote admin (no local requester) and an id we never saw both reach every client
+    TEST_ASSERT_EQUAL_INT(2, meshService.pushConfigToOtherPhoneClients(changed, 0));
+    TEST_ASSERT_EQUAL_INT(2, meshService.pushConfigToOtherPhoneClients(changed, 0xBEEF));
+
+    PhoneAPI *clients[] = {mui, ble};
+    for (PhoneAPI *client : clients) {
+        MeshService::ConfigSyncItem items[4];
+        // repeated changes of one section coalesce into a single re-send
+        TEST_ASSERT_EQUAL_INT(1, drainConfigSync(meshService, client, items, 4));
+        TEST_ASSERT_EQUAL_UINT8(MeshService::ConfigSyncItem::MODULE_CONFIG, items[0].kind);
+        TEST_ASSERT_EQUAL_UINT8(meshtastic_ModuleConfig_mqtt_tag, items[0].index);
+    }
+
+    MeshService::ConfigSyncSet nothing;
+    TEST_ASSERT_EQUAL_INT(0, meshService.pushConfigToOtherPhoneClients(nothing, 0));
+}
+
+void test_config_sync_cleared_on_unregister(void)
+{
+    MeshService meshService;
+    DummyClientToken t1, t2;
+    PhoneAPI *mui = asClient(t1);
+    PhoneAPI *ble = asClient(t2);
+
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(mui, MeshService::STATE_PACKET));
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(ble, MeshService::STATE_BLE));
+
+    MeshService::ConfigSyncSet changed;
+    changed.config = 1u << meshtastic_Config_device_tag;
+    meshService.noteAdminRequestOrigin(42, mui);
+    TEST_ASSERT_EQUAL_INT(1, meshService.pushConfigToOtherPhoneClients(changed, 42));
+    TEST_ASSERT_TRUE(meshService.hasPendingConfigForPhone(ble));
+
+    // a client that disconnects drops its pending sections; a fresh connection downloads the full config anyway
+    meshService.unregisterPhoneClient(ble);
+    TEST_ASSERT_FALSE(meshService.hasPendingConfigForPhone(ble));
+    TEST_ASSERT_TRUE(meshService.registerPhoneClient(ble, MeshService::STATE_BLE));
+    TEST_ASSERT_FALSE(meshService.hasPendingConfigForPhone(ble));
+}
+
 } // namespace
 
 void setUp(void) {}
@@ -923,6 +1029,9 @@ void setup()
     RUN_TEST(test_xmodem_owner_released_on_every_close);
 #endif
     RUN_TEST(test_rejected_client_receives_error_notification);
+    RUN_TEST(test_config_sync_skips_requester_and_reaches_other_clients);
+    RUN_TEST(test_config_sync_unknown_requester_reaches_all_and_coalesces);
+    RUN_TEST(test_config_sync_cleared_on_unregister);
     exit(UNITY_END());
 }
 
