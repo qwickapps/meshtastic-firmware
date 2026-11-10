@@ -52,8 +52,8 @@ constexpr uint16_t kPreferredBleTxTimeUs = (kPreferredBleTxOctets + 14) * 8;
     Up to MAX_BLE_PHONE_CLIENTS centrals (phone, tablet, watch) can be connected at once. Each connection gets a slot in
     bleSlots and its own BluetoothPhoneAPI (registered as a separate MeshService fan-out client), with its own ToRadio /
     FromRadio queues, fromNum notify state, duplicate filter and deferred close. Only the NimBLE host task claims or releases
-    a slot (GAP connect / disconnect); the main task only reads the table. Advertising resumes after a connect while slots
-    remain. With one central connected, behaviour is the same as the single-connection design.
+    a slot (GAP connect / disconnect); the main task only reads the table. While slots remain after a connect, advertising
+    resumes at a slow 1-2 s interval; with every slot taken there is no advertising. One central otherwise behaves as before.
 */
 #ifndef MAX_BLE_PHONE_CLIENTS
 #define MAX_BLE_PHONE_CLIENTS 1
@@ -82,6 +82,13 @@ static BleSlotTable<MAX_BLE_PHONE_CLIENTS> bleSlots;
 
 // CCCD "notifications enabled" bit, as NimBLE reports it to onSubscribe.
 constexpr uint16_t kSubscribedNotify = 0x0001;
+
+#ifndef NIMBLE_TWO
+// Advertising interval (0.625 ms units, 1-2 s) while a central is connected and another may join; NimBLE host task only.
+constexpr uint16_t kAnotherCentralAdvItvlMin = 1600;
+constexpr uint16_t kAnotherCentralAdvItvlMax = 3200;
+static bool advertisingForAnotherCentral = false;
+#endif
 
 #ifndef NIMBLE_TWO
 /// Main task. NimBLECharacteristic::notify() walks a subscriber vector the host task edits on every (un)subscribe and
@@ -1032,19 +1039,27 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
             resumeAdvertising();
     }
 
+    /// NimBLE task. Advertise only while a slot is free: at NimBLE's fast default interval with no central connected (as
+    /// before multi-central), slowly while a central is connected and another may still join.
     void resumeAdvertising()
     {
+        if (bleSlots.full())
+            return;
 #ifdef NIMBLE_TWO
         ble->startAdvertising();
 #else
+        const bool forAnotherCentral = bleSlots.count() > 0;
         NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
-        if (!pAdvertising->start(0)) {
-            if (pAdvertising->isAdvertising()) {
-                LOG_DEBUG("BLE advertising already running");
-            } else {
-                LOG_ERROR("BLE failed to restart advertising");
-            }
+        if (pAdvertising->isAdvertising()) {
+            if (forAnotherCentral == advertisingForAnotherCentral)
+                return;
+            pAdvertising->stop(); // the interval only changes on a new start
         }
+        pAdvertising->setMinInterval(forAnotherCentral ? kAnotherCentralAdvItvlMin : 0);
+        pAdvertising->setMaxInterval(forAnotherCentral ? kAnotherCentralAdvItvlMax : 0);
+        advertisingForAnotherCentral = forAnotherCentral;
+        if (!pAdvertising->start(0))
+            LOG_ERROR("BLE failed to restart advertising");
 #endif
     }
 
@@ -1122,7 +1137,7 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
         }
         releasePairingDisplay(connHandle);
 
-        // Restart Advertising
+        // Restart Advertising (not while every slot is taken: a refused central would reconnect in a loop)
         resumeAdvertising();
     }
 };
@@ -1252,6 +1267,9 @@ void NimbleBluetooth::setup()
     NimbleBluetoothServerCallback *serverCallbacks = new NimbleBluetoothServerCallback();
 #endif
     bleServer->setCallbacks(serverCallbacks, true);
+#if !defined(NIMBLE_TWO) && !CONFIG_BT_NIMBLE_EXT_ADV
+    bleServer->advertiseOnDisconnect(false); // onDisconnect decides, from the slot table
+#endif
     setupService();
     startAdvertising();
 }
