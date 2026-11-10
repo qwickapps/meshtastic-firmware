@@ -92,11 +92,11 @@ template <size_t N> class BleSlotTable
     /// Any task. True when no further connection can get a slot.
     bool full() const { return count() >= usable(); }
 
-    /// Setup only (before any connection). Clamped to [1, N].
-    void setLimit(size_t newLimit) { limit = newLimit < 1 ? 1 : (newLimit > N ? N : newLimit); }
-    size_t usable() const { return limit; }
+    /// Setup, or the BLE host task (the task that claims). Clamped to [1, N]. Slots already claimed are kept.
+    void setLimit(size_t newLimit) { limit.store(newLimit < 1 ? 1 : (newLimit > N ? N : newLimit)); }
+    size_t usable() const { return limit.load(); }
 
   private:
     std::array<std::atomic<uint16_t>, N> handles;
-    size_t limit = N;
+    std::atomic<size_t> limit{N};
 };

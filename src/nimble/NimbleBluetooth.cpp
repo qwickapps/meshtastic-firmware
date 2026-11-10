@@ -194,6 +194,13 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
     /// Last fromNum value of this client, returned when this connection reads the fromNum characteristic.
     std::atomic<uint32_t> lastFromNum{0};
 
+#if MAX_BLE_PHONE_CLIENTS > 1
+    /// The FromRadio value this connection's last read returned, for the follow-up pieces of a long read (see FROMRADIO
+    /// LONG READS). NimBLE host task only.
+    uint8_t longReadSnapshot[meshtastic_FromRadio_size] = {0};
+    uint16_t longReadSnapshotLen = 0;
+#endif
+
     /* Packets from phone (BLE onWrite callback), and the disconnect handoff to the main task (see DISCONNECT) */
     // Array-backed (memcpy) to avoid dynamic memory allocations and frees across FreeRTOS tasks.
     SessionHandoffQueue<NimBLEAttValue, NIMBLE_BLUETOOTH_FROM_PHONE_QUEUE_SIZE> fromPhone;
@@ -295,6 +302,9 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         // Clear the last ToRadio packet buffer to avoid rejecting first packet from new connection
         memset(lastToRadio, 0, sizeof(lastToRadio));
         fromNumSubscription = 0;
+#if MAX_BLE_PHONE_CLIENTS > 1
+        longReadSnapshotLen = 0;
+#endif
 
         setIntervalFromNow(0);
         concurrency::mainDelay.interrupt(); // wake up main loop if sleeping
@@ -540,6 +550,78 @@ static BluetoothPhoneAPI *apiForConn(uint16_t conn_handle)
     return slot >= 0 ? bluetoothPhoneAPIs[slot] : nullptr;
 }
 
+#if MAX_BLE_PHONE_CLIENTS > 1
+/*
+  FROMRADIO LONG READS (NimBLE-Arduino 1.4.3):
+    A FromRadio value longer than the connection's ATT MTU - 3 is read in pieces (Read, then Read Blob with an offset).
+    NimBLECharacteristic::handleGapEvent (NimBLECharacteristic.cpp:283-294) calls onRead only for the first piece and
+    answers every follow-up from the characteristic's single shared m_value. With two centrals, a read by B between A's
+    pieces replaces m_value, and A silently gets B's bytes spliced into its FromRadio; if B's value fits A's MTU, NimBLE
+    even calls onRead for A's follow-up and pops a packet A never receives. Apple centrals often negotiate an MTU below
+    the 517 we prefer, so long reads do happen.
+
+    Guard: the FromRadio characteristic's GATT access callback is wrapped. First pieces still go through NimBLE (onRead
+    pops the packet; handleRead keeps a copy in that connection's BluetoothPhoneAPI). Follow-up pieces are answered from
+    that copy and never touch m_value or onRead. Both paths run only on the NimBLE host task, so the copy needs no lock.
+    If the guard cannot be installed, or a read is ever seen bypassing it, the slot limit drops to 1.
+
+    The wrapped callback is reached through the service's ble_gatt_chr_def, which the NimBLE host reads on every access
+    (ble_gatts_chr_val_access). NimBLE-Arduino only rebuilds that table when services change after start
+    (NimBLEServer::serviceChanged), which this firmware never does.
+*/
+namespace
+{
+// Standard explicit-instantiation idiom to read NimBLEService::m_pSvcDef without patching the library.
+template <typename Tag, typename Tag::type Member> struct PrivateMemberAccess {
+    friend typename Tag::type privateMember(Tag) { return Member; }
+};
+struct NimBLEServiceSvcDefTag {
+    using type = ble_gatt_svc_def *NimBLEService::*;
+    friend type privateMember(NimBLEServiceSvcDefTag);
+};
+template struct PrivateMemberAccess<NimBLEServiceSvcDefTag, &NimBLEService::m_pSvcDef>;
+} // namespace
+
+static ble_gatt_access_fn *nimbleFromRadioAccess = nullptr; // NimBLECharacteristic::handleGapEvent
+static bool fromRadioReadViaGuard = false;                  // NimBLE host task only
+
+static int fromRadioAccessGuard(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    // Same follow-up test NimBLE itself uses (NimBLECharacteristic.cpp:285): a read at an offset gets a fresh mbuf whose
+    // packet header carries no user header (8 bytes), a first read gets the ATT response mbuf.
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR && !(ctxt->om->om_pkthdr_len > 8)) {
+        BluetoothPhoneAPI *api = apiForConn(conn_handle);
+        if (!api)
+            return BLE_ATT_ERR_UNLIKELY;
+        // The host trims the leading `offset` bytes; an offset past the copy is rejected as BLE_ATT_ERR_INVALID_OFFSET.
+        int rc = os_mbuf_append(ctxt->om, api->longReadSnapshot, api->longReadSnapshotLen);
+        return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+
+    fromRadioReadViaGuard = true;
+    int rc = nimbleFromRadioAccess(conn_handle, attr_handle, ctxt, arg);
+    fromRadioReadViaGuard = false;
+    return rc;
+}
+
+/// Setup, after bleService->start() built the service's GATT table.
+static bool installFromRadioLongReadGuard(NimBLEService *service, NimBLECharacteristic *fromRadio)
+{
+    ble_gatt_svc_def *svc = service->*privateMember(NimBLEServiceSvcDefTag());
+    if (!svc || !svc[0].characteristics)
+        return false;
+    for (const ble_gatt_chr_def *chr = svc[0].characteristics; chr->uuid != nullptr; ++chr) {
+        if (chr->arg == fromRadio && chr->access_cb != nullptr) {
+            nimbleFromRadioAccess = chr->access_cb;
+            // The table is heap memory NimBLEService allocated non-const; the host only sees it through const pointers.
+            const_cast<ble_gatt_chr_def *>(chr)->access_cb = fromRadioAccessGuard;
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
 /*
   NimBLE-Arduino 1.x DOUBLE DISPATCH:
     NimBLECharacteristic::handleGapEvent (NimBLECharacteristic.cpp:288-289 for reads, :319-320 for writes) calls BOTH
@@ -724,6 +806,16 @@ class NimbleBluetoothFromRadioCallback : public NimBLECharacteristicCallbacks
 #endif
 
         pCharacteristic->setValue(fromRadioBytes, numBytes);
+
+#if MAX_BLE_PHONE_CLIENTS > 1
+        // Follow-up pieces of a long read are answered from this copy (see FROMRADIO LONG READS).
+        memcpy(bluetoothPhoneAPI->longReadSnapshot, fromRadioBytes, numBytes);
+        bluetoothPhoneAPI->longReadSnapshotLen = numBytes;
+        if (!fromRadioReadViaGuard && bleSlots.usable() > 1) {
+            LOG_ERROR("BLE FromRadio read bypassed the long-read guard; allowing one central from now on");
+            bleSlots.setLimit(1);
+        }
+#endif
 
         // If we sent something, wake up the main loop if it's sleeping in case there are more packets ready to enqueue.
         if (numBytes != 0) {
@@ -1140,9 +1232,19 @@ void NimbleBluetooth::setupService()
 
     bleService->start();
 
-    // Until FromRadio long reads are made per connection, a second central could receive bytes spliced from another
-    // central's FromRadio: stay at one central.
+    // More than one central only with per-connection FromRadio long reads (see FROMRADIO LONG READS): without them a
+    // central could receive bytes spliced from another central's FromRadio.
+#if MAX_BLE_PHONE_CLIENTS > 1
+    if (installFromRadioLongReadGuard(bleService, FromRadioCharacteristic)) {
+        bleSlots.setLimit(MAX_BLE_PHONE_CLIENTS);
+        LOG_INFO("BLE: up to %u centrals at once", (unsigned)MAX_BLE_PHONE_CLIENTS);
+    } else {
+        bleSlots.setLimit(1);
+        LOG_ERROR("BLE: FromRadio long-read guard not installed, allowing one central");
+    }
+#else
     bleSlots.setLimit(1);
+#endif
 
     // Setup the battery service
     NimBLEService *batteryService = bleServer->createService(NimBLEUUID((uint16_t)0x180f)); // 0x180F is the Battery Service
