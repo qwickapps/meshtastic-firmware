@@ -4,6 +4,7 @@
 #include "PhoneAPI.h"
 #include "Router.h"
 #include "SPILock.h"
+#include "BleSlotTable.h"
 #include "SessionHandoffQueue.h"
 #include "TestUtil.h"
 #include "concurrency/LockGuard.h"
@@ -595,6 +596,40 @@ void test_session_handoff_queue_bounds_and_disconnect(void)
     TEST_ASSERT_FALSE(r.closeFirst);
 }
 
+// Multi-BLE: each connection handle gets its own slot, a full table refuses further centrals, a freed slot is reused,
+// and readers never claim. A limit of 1 keeps the single-central behaviour.
+void test_ble_slot_table_claim_release_and_limit(void)
+{
+    BleSlotTable<3> t;
+    TEST_ASSERT_EQUAL_UINT32(0u, (uint32_t)t.count());
+    TEST_ASSERT_EQUAL_UINT16(BleSlotTable<3>::kNoHandle, t.firstConnectedHandle());
+
+    TEST_ASSERT_EQUAL_INT(0, t.claim(5));
+    TEST_ASSERT_EQUAL_INT(1, t.claim(7));
+    TEST_ASSERT_EQUAL_INT(0, t.claim(5)); // same handle, same slot
+    TEST_ASSERT_EQUAL_INT(2, t.claim(9));
+    TEST_ASSERT_TRUE(t.full());
+    TEST_ASSERT_EQUAL_INT(-1, t.claim(11));
+
+    TEST_ASSERT_EQUAL_INT(1, t.release(7));
+    TEST_ASSERT_EQUAL_INT(-1, t.find(7));
+    TEST_ASSERT_EQUAL_INT(-1, t.release(7)); // released once
+    TEST_ASSERT_FALSE(t.full());
+    TEST_ASSERT_EQUAL_INT(1, t.claim(11));
+    TEST_ASSERT_EQUAL_UINT16(5, t.firstConnectedHandle());
+    TEST_ASSERT_EQUAL_INT(-1, t.claim(BleSlotTable<3>::kNoHandle));
+
+    BleSlotTable<3> single;
+    single.setLimit(1);
+    TEST_ASSERT_EQUAL_INT(0, single.claim(1));
+    TEST_ASSERT_TRUE(single.full());
+    TEST_ASSERT_EQUAL_INT(-1, single.claim(2));
+    single.setLimit(0);
+    TEST_ASSERT_EQUAL_UINT32(1u, (uint32_t)single.usable());
+    single.setLimit(9);
+    TEST_ASSERT_EQUAL_UINT32(3u, (uint32_t)single.usable());
+}
+
 // 2: a packet replayed from the store-and-forward history reaches every registered client, not just the first poller.
 void test_store_forward_packet_fanned_out_to_every_client(void)
 {
@@ -1018,6 +1053,7 @@ void setup()
     RUN_TEST(test_client_sent_packet_reaches_other_clients_only);
     RUN_TEST(test_ble_reconnect_before_runonce_closes_old_session_first);
     RUN_TEST(test_session_handoff_queue_bounds_and_disconnect);
+    RUN_TEST(test_ble_slot_table_claim_release_and_limit);
     RUN_TEST(test_store_forward_packet_fanned_out_to_every_client);
     RUN_TEST(test_store_forward_gated_on_live_client_with_room);
 #if !MESHTASTIC_EXCLUDE_STOREFORWARD
