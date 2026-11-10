@@ -4,6 +4,7 @@
 #include "PhoneAPI.h"
 #include "Router.h"
 #include "SPILock.h"
+#include "SessionHandoffQueue.h"
 #include "TestUtil.h"
 #include "concurrency/LockGuard.h"
 #include "mesh-pb-constants.h"
@@ -11,6 +12,7 @@
 #include "xmodem.h"
 #include <cstring>
 #include <unity.h>
+#include <vector>
 
 class MeshServiceTestAccess
 {
@@ -503,6 +505,96 @@ void test_client_sent_packet_reaches_other_clients_only(void)
     TEST_ASSERT_FALSE(MeshService::isSharedWithOtherClients(&p));
 }
 
+// Consumes a SessionHandoffQueue exactly like BluetoothPhoneAPI::runOnceHandleFromPhoneQueue does on the main task.
+class HandoffTestPhoneAPI : public PhoneAPI
+{
+  public:
+    HandoffTestPhoneAPI() { api_type = TYPE_BLE; }
+    SessionHandoffQueue<std::vector<uint8_t>, 4> fromPhone;
+    int closes = 0;
+
+    void writeWantConfig(uint32_t nonce)
+    {
+        meshtastic_ToRadio tr = meshtastic_ToRadio_init_zero;
+        tr.which_payload_variant = meshtastic_ToRadio_want_config_id_tag;
+        tr.want_config_id = nonce;
+        std::vector<uint8_t> buf(meshtastic_ToRadio_size);
+        buf.resize(pb_encode_to_bytes(buf.data(), buf.size(), &meshtastic_ToRadio_msg, &tr));
+        TEST_ASSERT_TRUE(fromPhone.push(buf));
+    }
+    void runOnce()
+    {
+        std::vector<uint8_t> val;
+        auto popped = fromPhone.pop(val);
+        if (popped.closeFirst) {
+            closes++;
+            close();
+        }
+        if (popped.havePacket)
+            handleToRadio(val.data(), val.size());
+    }
+
+  protected:
+    bool checkIsConnected() override { return true; }
+};
+
+// 5: BLE disconnect, reconnect and want_config written before the main task ran: the old session is closed first (its
+// queued packets dropped), then the new session starts clean.
+void test_ble_reconnect_before_runonce_closes_old_session_first(void)
+{
+    MeshService meshService;
+    MeshService *previousService = service;
+    service = &meshService;
+
+    {
+        HandoffTestPhoneAPI ble;
+        ble.writeWantConfig(1);
+        ble.runOnce();
+        TEST_ASSERT_TRUE(ble.isConnected());
+        meshService.sendToPhone(allocDecodedPacket(1301, NODENUM_BROADCAST)); // queued for the old session
+
+        ble.fromPhone.disconnect(); // NimBLE task
+        ble.writeWantConfig(2);     // new connection, before the main task ran
+        TEST_ASSERT_EQUAL_UINT32(1u, (uint32_t)ble.fromPhone.size());
+
+        ble.runOnce();
+        TEST_ASSERT_EQUAL(1, ble.closes);
+        TEST_ASSERT_TRUE(ble.isConnected());
+        TEST_ASSERT_NULL(meshService.getForPhone(&ble)); // old session's packet did not leak into the new one
+        TEST_ASSERT_FALSE(ble.fromPhone.takePendingClose());
+
+        // Disconnect without reconnect: the close is handed over exactly once.
+        ble.fromPhone.disconnect();
+        TEST_ASSERT_TRUE(ble.fromPhone.takePendingClose());
+        TEST_ASSERT_FALSE(ble.fromPhone.takePendingClose());
+    }
+
+    TEST_ASSERT_EQUAL_UINT32(0u, meshService.api_state_mask);
+    service = previousService;
+}
+
+// 5: writes beyond the queue depth are refused, not overwritten, and the disconnect drops queued writes.
+void test_session_handoff_queue_bounds_and_disconnect(void)
+{
+    SessionHandoffQueue<int, 2> q;
+    TEST_ASSERT_TRUE(q.push(1));
+    TEST_ASSERT_TRUE(q.push(2));
+    TEST_ASSERT_FALSE(q.push(3));
+    int v = 0;
+    auto r = q.pop(v);
+    TEST_ASSERT_FALSE(r.closeFirst);
+    TEST_ASSERT_TRUE(r.havePacket);
+    TEST_ASSERT_EQUAL(1, v);
+
+    q.disconnect();
+    TEST_ASSERT_EQUAL_UINT32(0u, (uint32_t)q.size());
+    r = q.pop(v);
+    TEST_ASSERT_TRUE(r.closeFirst);
+    TEST_ASSERT_FALSE(r.havePacket);
+    r = q.pop(v);
+    TEST_ASSERT_FALSE(r.closeFirst);
+}
+
 // 2: a packet replayed from the store-and-forward history reaches every registered client, not just the first poller.
 void test_store_forward_packet_fanned_out_to_every_client(void)
 {
@@ -818,6 +910,8 @@ void setup()
     RUN_TEST(test_full_detached_backlog_evicts_oldest_non_text_first);
     RUN_TEST(test_stale_client_suspended_and_released_until_it_reads);
     RUN_TEST(test_client_sent_packet_reaches_other_clients_only);
+    RUN_TEST(test_ble_reconnect_before_runonce_closes_old_session_first);
+    RUN_TEST(test_session_handoff_queue_bounds_and_disconnect);
     RUN_TEST(test_store_forward_packet_fanned_out_to_every_client);
     RUN_TEST(test_store_forward_gated_on_live_client_with_room);
 #if !MESHTASTIC_EXCLUDE_STOREFORWARD
