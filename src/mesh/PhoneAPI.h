@@ -52,6 +52,10 @@ class PhoneAPI
 
     State state = STATE_SEND_NOTHING;
 
+    /// Set when handleStartConfig() could not get a MeshService fanout slot: a ClientNotification explaining why is sent
+    /// (outside the fanout, which this client is not part of) instead of leaving the client waiting silently.
+    bool registrationRejected = false;
+
     uint8_t config_state = 0;
 
     // Hashmap of timestamps for last time we received a packet on the API per portnum

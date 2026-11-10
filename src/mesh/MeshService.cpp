@@ -484,7 +484,10 @@ bool MeshService::registerPhoneClient(PhoneAPI *client, APIState state)
     if (slotIndex < 0) {
         slotIndex = findFreeClientSlotLocked();
         if (slotIndex < 0) {
-            LOG_ERROR("No free phone client slots available (max=%d)", MAX_PHONE_API_CLIENTS);
+            LOG_ERROR("No free phone client slots (max=%d, in use: ble=%u wifi=%u serial=%u packet=%u http=%u eth=%u), "
+                      "rejecting new state=%d client",
+                      MAX_PHONE_API_CLIENTS, apiStateCounts[STATE_BLE], apiStateCounts[STATE_WIFI], apiStateCounts[STATE_SERIAL],
+                      apiStateCounts[STATE_PACKET], apiStateCounts[STATE_HTTP], apiStateCounts[STATE_ETH], state);
             return false;
         }
     }

@@ -94,9 +94,14 @@ void PhoneAPI::handleStartConfig()
         }
 
         if (!service->registerPhoneClient(this, clientState)) {
-            LOG_ERROR("Failed to register phone client for fanout (api_type=%s), aborting config start", apiTypeName);
+            LOG_ERROR("Rejecting %s phone client: all %d phone API client slots are in use, config request ignored", apiTypeName,
+                      MAX_PHONE_API_CLIENTS);
+            // Tell the client why it gets nothing, instead of leaving it waiting for a config that never comes.
+            registrationRejected = true;
+            onNowHasData(fromRadioNum);
             return;
         }
+        registrationRejected = false;
         onConnectionChanged(true);
         observe(&service->fromNumChanged);
 #ifdef FSCom
@@ -182,6 +187,7 @@ void PhoneAPI::close()
     } else {
         service->unregisterPhoneClient(this);
     }
+    registrationRejected = false;
 }
 
 bool PhoneAPI::checkConnectionTimeout()
@@ -318,6 +324,15 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
     switch (state) {
     case STATE_SEND_NOTHING:
         LOG_DEBUG("FromRadio=STATE_SEND_NOTHING");
+        if (registrationRejected) {
+            registrationRejected = false;
+            // No logging below this point: fromRadioScratch is shared with the log encoder.
+            fromRadioScratch.which_payload_variant = meshtastic_FromRadio_clientNotification_tag;
+            fromRadioScratch.clientNotification.level = meshtastic_LogRecord_Level_ERROR;
+            fromRadioScratch.clientNotification.time = getValidTime(RTCQualityFromNet);
+            snprintf(fromRadioScratch.clientNotification.message, sizeof(fromRadioScratch.clientNotification.message),
+                     "Too many clients connected (max %d). Disconnect another client and reconnect.", MAX_PHONE_API_CLIENTS);
+        }
         break;
     case STATE_SEND_MY_INFO:
         LOG_DEBUG("FromRadio=STATE_SEND_MY_INFO");
@@ -738,7 +753,7 @@ bool PhoneAPI::available()
 {
     switch (state) {
     case STATE_SEND_NOTHING:
-        return false;
+        return registrationRejected; // the "too many clients" notification is the only thing we send unregistered
     case STATE_SEND_MY_INFO:
     case STATE_SEND_UIDATA:
     case STATE_SEND_CHANNELS:
