@@ -32,7 +32,7 @@ extern Allocator<meshtastic_ClientNotification> &clientNotificationPool;
 class PhoneAPI;
 
 #ifndef MAX_PHONE_API_CLIENTS
-#define MAX_PHONE_API_CLIENTS 3
+#define MAX_PHONE_API_CLIENTS 5
 #endif
 
 /**
@@ -87,6 +87,9 @@ class MeshService
         PhoneAPI *client = nullptr;
         APIState state = STATE_DISCONNECTED;
         bool active = false;
+        /// Stale client whose queued packets were released; gets no packets until it reads again.
+        bool suspended = false;
+        uint32_t lastDrainMsec = 0;
 
 #if defined(ARCH_PORTDUINO)
         PointerQueue<PacketFanoutEntry> packetQueue;
@@ -133,6 +136,12 @@ class MeshService
 
     PhoneClientSlot phoneClients[MAX_PHONE_API_CLIENTS];
 
+#if defined(ARCH_PORTDUINO)
+    PointerQueue<meshtastic_MeshPacket> detachedPacketBacklog;
+#else
+    StaticPointerQueue<meshtastic_MeshPacket, MAX_RX_TOPHONE> detachedPacketBacklog;
+#endif
+
     /// Protects fanout client registry and all per-client fanout queues
     concurrency::Lock phoneClientsLock;
 
@@ -152,6 +161,14 @@ class MeshService
     int findClientSlotByPtrLocked(const PhoneAPI *client);
     int findFreeClientSlotLocked() const;
     void clearClientSlotLocked(PhoneClientSlot &slot);
+    /// A client with pending packets that has not drained one for kStaleClientDrainMs is considered stale: it no longer
+    /// holds the node awake and no longer throttles shared producers (e.g. store-and-forward replay).
+    static constexpr uint32_t kStaleClientDrainMs = 30 * 1000;
+    bool isSlotStaleLocked(PhoneClientSlot &slot);
+    void suspendIfStaleLocked(PhoneClientSlot &slot, int slotIndex);
+    void resumeLocked(PhoneClientSlot &slot);
+    bool makeRoomInPacketQueueLocked(PhoneClientSlot &slot, bool newIsText);
+    void replayDetachedPacketBacklogLocked(PhoneClientSlot &slot);
     void updateApiStateLocked(APIState preferred = STATE_DISCONNECTED);
 
     void releasePacketFanoutEntryLocked(PacketFanoutEntry *entry);
@@ -159,7 +176,8 @@ class MeshService
     void releaseMqttProxyFanoutEntryLocked(MqttProxyFanoutEntry *entry);
     void releaseClientNotificationFanoutEntryLocked(ClientNotificationFanoutEntry *entry);
 
-    bool enqueuePacketFanoutLocked(meshtastic_MeshPacket *p);
+    bool enqueuePacketFanoutLocked(meshtastic_MeshPacket *p, const PhoneAPI *exclude = nullptr);
+    void enqueueToPhoneClients(meshtastic_MeshPacket *p);
     bool enqueueQueueStatusFanoutLocked(meshtastic_QueueStatus *qs);
     bool enqueueMqttProxyFanoutLocked(meshtastic_MqttClientProxyMessage *m);
     bool enqueueClientNotificationFanoutLocked(meshtastic_ClientNotification *cn);
@@ -196,6 +214,9 @@ class MeshService
     /// Return the next packet destined to the specified phone client.
     meshtastic_MeshPacket *getForPhone(PhoneAPI *client);
 
+    /// The client just read a FromRadio (any kind): it is not stale. Never logs (called while FromRadio buffers are in use).
+    void notePhoneClientRead(PhoneAPI *client);
+
     /// Allows handlers to free packets after they have been sent
     void releaseToPool(meshtastic_MeshPacket *p) { packetPool.release(p); }
 
@@ -230,7 +251,18 @@ class MeshService
      * Called by PhoneAPI.handleToRadio.  Note: p is a scratch buffer, this function is allowed to write to it but it can not keep
      * a reference
      */
-    void handleToRadio(meshtastic_MeshPacket &p);
+    void handleToRadio(meshtastic_MeshPacket &p, const PhoneAPI *origin = nullptr);
+
+    /// Packets a client sends that the other connected clients should show too (chat, alerts, waypoints).
+    static bool isSharedWithOtherClients(const meshtastic_MeshPacket *p)
+    {
+        return p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
+               (p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP || p->decoded.portnum == meshtastic_PortNum_ALERT_APP ||
+                p->decoded.portnum == meshtastic_PortNum_WAYPOINT_APP);
+    }
+
+    /// Fan a packet sent by one client out to every other registered client (takes ownership of p).
+    void sendToOtherPhones(meshtastic_MeshPacket *p, const PhoneAPI *origin);
 
     /** The radioConfig object just changed, call this to force the hw to change to the new settings
      * @return true if client devices should be sent a new set of radio configs
@@ -248,7 +280,7 @@ class MeshService
     /// Send a packet into the mesh - note p must have been allocated from packetPool.  We will return it to that pool after
     /// sending. This is the ONLY function you should use for sending messages into the mesh, because it also updates the nodedb
     /// cache
-    void sendToMesh(meshtastic_MeshPacket *p, RxSource src = RX_SRC_LOCAL, bool ccToPhone = false);
+    ErrorCode sendToMesh(meshtastic_MeshPacket *p, RxSource src = RX_SRC_LOCAL, bool ccToPhone = false);
 
     /** Attempt to cancel a previously sent packet from this _local_ node.  Returns true if a packet was found we could cancel */
     bool cancelSending(PacketId id);
@@ -258,6 +290,14 @@ class MeshService
 
     /// Send a packet to active phone clients
     void sendToPhone(meshtastic_MeshPacket *p);
+
+    /// Fan a packet replayed from the store-and-forward history out to every registered phone client. Unlike
+    /// sendToPhone() this is not subject to the "S&F server delivers text from its history" filter.
+    void sendStoreForwardToPhone(meshtastic_MeshPacket *p);
+
+    /// True when at least one non-stale client is registered and every non-stale client has room for one more packet,
+    /// i.e. a packet pulled from the S&F history now would reach every live client without displacing anything.
+    bool canAcceptStoreForwardPacket();
 
     /// Send an MQTT message to active phone clients for client proxying
     virtual void sendMqttMessageToClientProxy(meshtastic_MqttClientProxyMessage *m);
@@ -284,6 +324,7 @@ class MeshService
     /// needs to keep the packet around it makes a copy
     int handleFromRadio(const meshtastic_MeshPacket *p);
     friend class RoutingModule;
+    friend class MeshServiceTestAccess; // native unit tests (test/test_api_fanout)
 };
 
 extern MeshService *service;

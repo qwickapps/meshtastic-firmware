@@ -94,9 +94,14 @@ void PhoneAPI::handleStartConfig()
         }
 
         if (!service->registerPhoneClient(this, clientState)) {
-            LOG_ERROR("Failed to register phone client for fanout (api_type=%s), aborting config start", apiTypeName);
+            LOG_ERROR("Rejecting %s phone client: all %d phone API client slots are in use, config request ignored", apiTypeName,
+                      MAX_PHONE_API_CLIENTS);
+            // Tell the client why it gets nothing, instead of leaving it waiting for a config that never comes.
+            registrationRejected = true;
+            onNowHasData(fromRadioNum);
             return;
         }
+        registrationRejected = false;
         onConnectionChanged(true);
         observe(&service->fromNumChanged);
 #ifdef FSCom
@@ -180,6 +185,12 @@ void PhoneAPI::close()
     } else {
         service->unregisterPhoneClient(this);
     }
+#ifdef FSCom
+    // In every state: a transfer bound to this client can never complete now, and a deleted PhoneAPI must not stay owner.
+    xModem.abortFor(this);
+    xmodemPacketForPhone = meshtastic_XModem_init_zero;
+#endif
+    registrationRejected = false;
 }
 
 bool PhoneAPI::checkConnectionTimeout()
@@ -220,7 +231,14 @@ bool PhoneAPI::handleToRadio(const uint8_t *buf, size_t bufLength)
         case meshtastic_ToRadio_xmodemPacket_tag:
             LOG_INFO("Got xmodem packet");
 #ifdef FSCom
-            xModem.handlePacket(toRadioScratch.xmodemPacket);
+            if (!isConnected()) {
+                LOG_WARN("Ignore xmodem packet from a client without a config session");
+            } else if (!xModem.handlePacket(toRadioScratch.xmodemPacket, this)) {
+                // Another client owns the running transfer: tell this one to give up instead of leaving it waiting.
+                xmodemPacketForPhone = meshtastic_XModem_init_zero;
+                xmodemPacketForPhone.control = meshtastic_XModem_Control_CAN;
+                onNowHasData(fromRadioNum);
+            }
 #endif
             break;
 #if !MESHTASTIC_EXCLUDE_MQTT
@@ -311,6 +329,15 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
     switch (state) {
     case STATE_SEND_NOTHING:
         LOG_DEBUG("FromRadio=STATE_SEND_NOTHING");
+        if (registrationRejected) {
+            registrationRejected = false;
+            // No logging below this point: fromRadioScratch is shared with the log encoder.
+            fromRadioScratch.which_payload_variant = meshtastic_FromRadio_clientNotification_tag;
+            fromRadioScratch.clientNotification.level = meshtastic_LogRecord_Level_ERROR;
+            fromRadioScratch.clientNotification.time = getValidTime(RTCQualityFromNet);
+            snprintf(fromRadioScratch.clientNotification.message, sizeof(fromRadioScratch.clientNotification.message),
+                     "Too many clients connected (max %d). Disconnect another client and reconnect.", MAX_PHONE_API_CLIENTS);
+        }
         break;
     case STATE_SEND_MY_INFO:
         LOG_DEBUG("FromRadio=STATE_SEND_MY_INFO");
@@ -635,6 +662,7 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
     if (fromRadioScratch.which_payload_variant != 0) {
         // Encapsulate as a FromRadio packet
         size_t numbytes = pb_encode_to_bytes(buf, meshtastic_FromRadio_size, &meshtastic_FromRadio_msg, &fromRadioScratch);
+        service->notePhoneClientRead(this); // a client still downloading its config is reading, not stale
 
         // VERY IMPORTANT to not print debug messages while writing to fromRadioScratch - because we use that same buffer
         // for logging (when we are encapsulating with protobufs)
@@ -731,7 +759,7 @@ bool PhoneAPI::available()
 {
     switch (state) {
     case STATE_SEND_NOTHING:
-        return false;
+        return registrationRejected; // the "too many clients" notification is the only thing we send unregistered
     case STATE_SEND_MY_INFO:
     case STATE_SEND_UIDATA:
     case STATE_SEND_CHANNELS:
@@ -766,20 +794,14 @@ bool PhoneAPI::available()
             return true;
 
 #ifdef FSCom
-        if (xmodemPacketForPhone.control == meshtastic_XModem_Control_NUL)
-            xmodemPacketForPhone = xModem.getForPhone();
-        if (xmodemPacketForPhone.control != meshtastic_XModem_Control_NUL) {
-            xModem.resetForPhone();
-            return true;
+        // Only responses addressed to this client: another client's transfer must not be consumed here.
+        if (xmodemPacketForPhone.control == meshtastic_XModem_Control_NUL) {
+            xmodemPacketForPhone = xModem.getForPhone(this);
+            if (xmodemPacketForPhone.control != meshtastic_XModem_Control_NUL)
+                xModem.resetForPhone(this);
         }
-#endif
-
-#ifdef ARCH_ESP32
-#if !MESHTASTIC_EXCLUDE_STOREFORWARD
-        // Check if StoreForward has packets stored for us.
-        if (!packetForPhone && storeForwardModule)
-            packetForPhone = storeForwardModule->getForPhone();
-#endif
+        if (xmodemPacketForPhone.control != meshtastic_XModem_Control_NUL)
+            return true;
 #endif
 
         if (!packetForPhone)
@@ -797,6 +819,10 @@ bool PhoneAPI::available()
 void PhoneAPI::sendNotification(meshtastic_LogRecord_Level level, uint32_t replyId, const char *message)
 {
     meshtastic_ClientNotification *cn = clientNotificationPool.allocZeroed();
+    if (!cn) {
+        LOG_WARN("Unable to allocate client notification");
+        return;
+    }
     cn->has_reply_id = true;
     cn->reply_id = replyId;
     cn->level = meshtastic_LogRecord_Level_WARNING;
@@ -878,7 +904,7 @@ bool PhoneAPI::handleToRadioPacket(meshtastic_MeshPacket &p)
     }
 
     lastPortNumToRadio[p.decoded.portnum] = millis();
-    service->handleToRadio(p);
+    service->handleToRadio(p, this);
     return true;
 }
 
