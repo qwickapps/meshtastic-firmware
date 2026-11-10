@@ -17,26 +17,16 @@ PacketAPI *PacketAPI::create(PacketServer *_server)
 }
 
 PacketAPI::PacketAPI(PacketServer *_server)
-    : concurrency::OSThread("PacketAPI"), isConnected(false), programmingMode(false), server(_server)
+    : concurrency::OSThread("PacketAPI"), isConnected(false), server(_server)
 {
     api_type = TYPE_PACKET;
 }
 
 int32_t PacketAPI::runOnce()
 {
-    bool success = false;
-#ifndef ARCH_PORTDUINO
-    if (config.bluetooth.enabled) {
-        if (!programmingMode) {
-            // in programmingMode we don't send any packets to the client except this one notify
-            programmingMode = true;
-            success = notifyProgrammingMode();
-        }
-    } else
-#endif
-    {
-        success = sendPacket();
-    }
+    // The touchscreen is served like any other phone client, also while Bluetooth is enabled: MUI and BLE phones
+    // receive every packet concurrently. device-ui enters programming mode only on explicit user request.
+    bool success = sendPacket();
     success |= receivePacket();
     return success ? 10 : 50;
 }
@@ -105,18 +95,6 @@ bool PacketAPI::sendPacket(void)
         }
     }
     return false;
-}
-
-bool PacketAPI::notifyProgrammingMode(void)
-{
-    // tell the client we are in programming mode by sending only the bluetooth config state
-    LOG_INFO("force client into programmingMode");
-    memset(&fromRadioScratch, 0, sizeof(fromRadioScratch));
-    fromRadioScratch.id = nodeDB->getNodeNum();
-    fromRadioScratch.which_payload_variant = meshtastic_FromRadio_config_tag;
-    fromRadioScratch.config.which_payload_variant = meshtastic_Config_bluetooth_tag;
-    fromRadioScratch.config.payload_variant.bluetooth = config.bluetooth;
-    return server->sendPacket(DataPacket<meshtastic_FromRadio>(0, fromRadioScratch));
 }
 
 /**
