@@ -50,13 +50,29 @@ the new node can build its node db)
 
 MeshService *service;
 
-#define MAX_MQTT_PROXY_MESSAGES (MAX_PHONE_API_CLIENTS * (MAX_RX_MQTTPROXY_TOPHONE + 1))
+/*
+ * Payload pool sizing for the per-client fanout.
+ *
+ * A payload is allocated once and shared (refcounted) by every client queue it is fanned out to, so the pools are sized by
+ * the number of *distinct* payloads that can be alive, not by clients x queue depth. For QueueStatus, MqttClientProxy and
+ * ClientNotification every active client receives every payload in order and a full queue drops its oldest entry, so each
+ * client's queue holds a suffix of the same global sequence (at most QUEUE_DEPTH distinct payloads shared by all clients)
+ * plus at most one older in-flight payload per client. One more covers a producer that has allocated but not yet enqueued.
+ *
+ *   distinct live payloads <= QUEUE_DEPTH + MAX_PHONE_API_CLIENTS + 1
+ *
+ * MeshPackets come from packetPool and are not affected. Producers must still null-check: a payload that cannot be
+ * allocated is dropped, never dereferenced.
+ */
+#define FANOUT_PAYLOAD_POOL_SIZE(queueDepth) ((queueDepth) + MAX_PHONE_API_CLIENTS + 1)
+
+#define MAX_MQTT_PROXY_MESSAGES FANOUT_PAYLOAD_POOL_SIZE(MAX_RX_MQTTPROXY_TOPHONE)
 static MemoryPool<meshtastic_MqttClientProxyMessage, MAX_MQTT_PROXY_MESSAGES> staticMqttClientProxyMessagePool;
 
-#define MAX_QUEUE_STATUS (MAX_PHONE_API_CLIENTS * (MAX_RX_QUEUESTATUS_TOPHONE + 1))
+#define MAX_QUEUE_STATUS FANOUT_PAYLOAD_POOL_SIZE(MAX_RX_QUEUESTATUS_TOPHONE)
 static MemoryPool<meshtastic_QueueStatus, MAX_QUEUE_STATUS> staticQueueStatusPool;
 
-#define MAX_CLIENT_NOTIFICATIONS (MAX_PHONE_API_CLIENTS * (MAX_RX_NOTIFICATION_TOPHONE + 1))
+#define MAX_CLIENT_NOTIFICATIONS FANOUT_PAYLOAD_POOL_SIZE(MAX_RX_NOTIFICATION_TOPHONE)
 static MemoryPool<meshtastic_ClientNotification, MAX_CLIENT_NOTIFICATIONS> staticClientNotificationPool;
 
 Allocator<meshtastic_MqttClientProxyMessage> &mqttClientProxyMessagePool = staticMqttClientProxyMessagePool;
@@ -1017,6 +1033,8 @@ void MeshService::enqueueToPhoneClients(meshtastic_MeshPacket *p)
 
 void MeshService::sendMqttMessageToClientProxy(meshtastic_MqttClientProxyMessage *m)
 {
+    if (!m)
+        return;
     LOG_DEBUG("Send mqtt message on topic '%s' to client for proxy", m->topic);
 
     bool delivered = false;
