@@ -53,6 +53,8 @@ class StoreForwardModule : private concurrency::OSThread, public ProtobufModule<
     // Unordered_map stores the last request for each nodeNum (`to` field)
     std::unordered_map<NodeNum, uint32_t> lastRequest;
 
+    friend class StoreForwardTestAccess; // native unit tests (test/test_api_fanout)
+
   public:
     StoreForwardModule();
 

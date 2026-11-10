@@ -1,12 +1,31 @@
 #include "DebugConfiguration.h"
 #include "MeshService.h"
+#include "NodeDB.h"
 #include "PhoneAPI.h"
+#include "Router.h"
+#include "mesh/CryptoEngine.h"
 #include "SPILock.h"
 #include "TestUtil.h"
 #include "mesh-pb-constants.h"
 #include "xmodem.h"
 #include <cstring>
 #include <unity.h>
+
+#if !MESHTASTIC_EXCLUDE_STOREFORWARD
+class StoreForwardTestAccess
+{
+  public:
+    static void makeServer(StoreForwardModule &sf, uint32_t records)
+    {
+        sf.records = records;
+        sf.populatePSRAM();
+        sf.is_server = true;
+    }
+    static bool busy(const StoreForwardModule &sf) { return sf.busy; }
+    static uint32_t cursor(StoreForwardModule &sf, NodeNum n) { return sf.lastRequest[n]; }
+    static int32_t runOnce(StoreForwardModule &sf) { return sf.runOnce(); }
+};
+#endif
 
 namespace
 {
@@ -334,6 +353,80 @@ void test_store_forward_gated_on_live_client_with_room(void)
     TEST_ASSERT_FALSE(meshService.canAcceptStoreForwardPacket());
 }
 
+#if !MESHTASTIC_EXCLUDE_STOREFORWARD
+class FanoutTestRouter : public Router
+{
+  public:
+    ~FanoutTestRouter()
+    {
+        delete cryptLock; // created by the Router constructor
+        cryptLock = NULL;
+    }
+};
+
+// 1: the local S&F drain (MeshService::loop) can stop part way, e.g. when a client queue is full. That must leave no
+// state behind that makes runOnce() send the rest of the local history to ourselves as STORE_FORWARD_APP.
+void test_store_forward_interrupted_local_drain_keeps_local_cursor(void)
+{
+    Router *previousRouter = router;
+    NodeDB *previousNodeDB = nodeDB;
+    const meshtastic_ModuleConfig_StoreForwardConfig previousSF = moduleConfig.store_forward;
+    FanoutTestRouter testRouter;
+    router = &testRouter;
+    if (!nodeDB)
+        nodeDB = new NodeDB();
+    moduleConfig.store_forward.enabled = true;
+    moduleConfig.store_forward.is_server = false;
+
+    {
+        StoreForwardModule sf;
+        StoreForwardTestAccess::makeServer(sf, 8);
+        const NodeNum local = nodeDB->getNodeNum();
+        const NodeNum remote = local ^ 0x5a5a;
+
+        for (uint32_t i = 0; i < 3; i++) {
+            meshtastic_MeshPacket mp = meshtastic_MeshPacket_init_zero;
+            mp.from = remote;
+            mp.to = NODENUM_BROADCAST;
+            mp.id = 900 + i;
+            mp.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+            mp.decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+            mp.decoded.payload.size = 1;
+            mp.decoded.payload.bytes[0] = 'a' + i;
+            sf.historyAdd(mp);
+        }
+
+        meshtastic_MeshPacket *first = sf.getForPhone(); // drain pulls one, then stops (client queue full)
+        TEST_ASSERT_NOT_NULL(first);
+        TEST_ASSERT_EQUAL_UINT32(900, first->id);
+        TEST_ASSERT_EQUAL(meshtastic_PortNum_TEXT_MESSAGE_APP, first->decoded.portnum);
+        packetPool.release(first);
+        TEST_ASSERT_FALSE(StoreForwardTestAccess::busy(sf));
+        TEST_ASSERT_EQUAL_UINT32(1, StoreForwardTestAccess::cursor(sf, local));
+
+        StoreForwardTestAccess::runOnce(sf);
+        TEST_ASSERT_EQUAL_UINT32(1, StoreForwardTestAccess::cursor(sf, local));
+
+        // The drain picks up where it stopped, as text.
+        for (uint32_t i = 1; i < 3; i++) {
+            meshtastic_MeshPacket *p = sf.getForPhone();
+            TEST_ASSERT_NOT_NULL(p);
+            TEST_ASSERT_EQUAL_UINT32(900 + i, p->id);
+            TEST_ASSERT_EQUAL(meshtastic_PortNum_TEXT_MESSAGE_APP, p->decoded.portnum);
+            packetPool.release(p);
+        }
+        TEST_ASSERT_NULL(sf.getForPhone());
+    }
+
+    moduleConfig.store_forward = previousSF;
+    if (nodeDB != previousNodeDB) {
+        delete nodeDB;
+        nodeDB = previousNodeDB;
+    }
+    router = previousRouter;
+}
+#endif
+
 #ifdef FSCom
 static meshtastic_XModem xmodemControl(meshtastic_XModem_Control control, uint16_t seq = 0, const char *name = nullptr)
 {
@@ -469,6 +562,9 @@ void setup()
     RUN_TEST(test_close_from_other_context_then_late_release_is_safe);
     RUN_TEST(test_store_forward_packet_fanned_out_to_every_client);
     RUN_TEST(test_store_forward_gated_on_live_client_with_room);
+#if !MESHTASTIC_EXCLUDE_STOREFORWARD
+    RUN_TEST(test_store_forward_interrupted_local_drain_keeps_local_cursor);
+#endif
 #ifdef FSCom
     RUN_TEST(test_xmodem_response_only_visible_to_requesting_client);
     RUN_TEST(test_xmodem_transfer_bound_to_owner_and_aborted_on_close);
