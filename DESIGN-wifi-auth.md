@@ -20,9 +20,18 @@ authenticated, without touching the serial or BLE paths.
 | `src/platform/esp32/main-esp32.cpp` | `QWICKMESH_BLE_WIFI_COEX` build flag (see below). |
 | `tools/qwickmesh_tcp_auth.py` | Python client helper, CLI (`gen-secret`, `provision`, `check`) and a `meshtastic` `StreamInterface` subclass. |
 
-The shared `APIServerPort` template is also used by the Ethernet API, so Ethernet builds get the same gate.
-The old RAK4631 reconnect-delay workaround in `APIServerPort::runOnce` was dropped: the pending-slot logic replaces
-the "close the previous connection" branch it hooked into.
+**Scope.** All of the above is compiled only when `QWICKMESH_TCP_AUTH` is defined, which only `heltec-v4` and
+`heltec-v4-coex` set (plus `MESHTASTIC_EXCLUDE_WEBSERVER`, moved from `heltec_v4_base` into `env:heltec-v4`). Every other
+target, including other Wi-Fi ESP32 boards and the RAK4631/RAK11310 Ethernet builds, compiles the original
+`APIServerPort`/`ServerAPI`/`StreamAPI`/`xmodem` code unchanged, including the RAK4631 reconnect backoff, and stock
+clients keep working there.
+
+**Revocation and session lifecycle.** `SecretStore` has a generation counter bumped by every `QMAUTH SET` and `CLEAR`.
+Each connection records the generation it started under; `APIServerPort::runOnce` closes the authenticated session and
+the in-flight handshake as soon as the secret is cleared or its generation changed (re-provisioning the same key also
+revokes). A new session is only activated after the previous one has been closed, so two authenticated sessions never
+overlap. Weak secrets (all bytes equal, including all-zero) are rejected. Per-peer failure counts decay by one per
+10 quiet minutes. Handshake secret copies are wiped on every teardown path, including the destructor.
 
 ## Protocol "QMA1"
 
@@ -102,6 +111,8 @@ has physical access and can reflash anyway, so that is the trust boundary.
 
 **Residual risks (accepted in phase 1)**
 
+* **FOLLOW-UP, required before use beyond a trusted LAN/VPN: per-frame MAC (or the TLS-PSK transport).** Not added in
+  this change.
 * **No confidentiality or integrity after the handshake.** Traffic is plaintext on the LAN. An on-path attacker
   can read it, or hijack the TCP stream after authentication. Use a trusted or isolated LAN, or a VPN/WireGuard
   segment until the TLS-PSK phase.

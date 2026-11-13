@@ -49,7 +49,7 @@
  **********************************************************************************************************************/
 
 #include "xmodem.h"
-#ifndef ARCH_STM32WL
+#ifdef QWICKMESH_TCP_AUTH
 #include "mesh/api/TcpAuth.h"
 #endif
 #include "SPILock.h"
@@ -168,8 +168,15 @@ bool XModemAdapter::handlePacket(meshtastic_XModem xmodemPacket, const PhoneAPI 
     case meshtastic_XModem_Control_STX:
         if ((xmodemPacket.seq == 0) && !isReceiving && !isTransmitting) {
             // NULL packet has the destination filename
+#ifdef QWICKMESH_TCP_AUTH
+            // The name must fit with a NUL terminator, otherwise the protected-path scan would read past the buffer
+            if (xmodemPacket.buffer.size >= sizeof(filename)) {
+                LOG_WARN("XModem: filename too long");
+                sendControl(meshtastic_XModem_Control_NAK);
+                break;
+            }
+            memset(filename, 0, sizeof(filename));
             memcpy(filename, &xmodemPacket.buffer.bytes, xmodemPacket.buffer.size);
-#ifndef ARCH_STM32WL
             // Never let any API client read, overwrite or probe the TCP auth secret file
             if (tcpauth::isProtectedPath(filename)) {
                 LOG_WARN("XModem: refusing protected path");
@@ -177,6 +184,8 @@ bool XModemAdapter::handlePacket(meshtastic_XModem xmodemPacket, const PhoneAPI 
                 sendControl(meshtastic_XModem_Control_NAK);
                 break;
             }
+#else
+            memcpy(filename, &xmodemPacket.buffer.bytes, xmodemPacket.buffer.size);
 #endif
 
             if (xmodemPacket.control == meshtastic_XModem_Control_SOH) { // Receive this file and put to Flash

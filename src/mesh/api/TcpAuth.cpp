@@ -1,4 +1,5 @@
 #include "TcpAuth.h"
+#ifdef QWICKMESH_TCP_AUTH
 #include <Crypto.h>
 #include <SHA256.h>
 #include <cstring>
@@ -100,6 +101,8 @@ Handshake::State Handshake::feed(const uint8_t *data, size_t len)
         state = FAILED;
     }
     memset(secret, 0, sizeof(secret)); // not needed any more
+    if (state == FAILED)
+        wipe();
     return state;
 }
 
@@ -118,6 +121,14 @@ void Handshake::wipe()
     memset(resp, 0, sizeof(resp));
 }
 
+void Handshake::wipeAll()
+{
+    memset(snonce, 0, sizeof(snonce));
+    memset(proof, 0, sizeof(proof));
+    have = 0;
+    state = FAILED;
+}
+
 // ------------------------------------------------------------------ Backoff
 
 static uint32_t delayFor(uint8_t failures)
@@ -129,6 +140,20 @@ static uint32_t delayFor(uint8_t failures)
         return Backoff::kMaxDelayMs;
     uint32_t ms = 1000UL << shift;
     return ms > Backoff::kMaxDelayMs ? Backoff::kMaxDelayMs : ms;
+}
+
+static uint8_t decayed(uint8_t failures, uint32_t lastMs, uint32_t nowMs)
+{
+    uint32_t periods = (uint32_t)(nowMs - lastMs) / Backoff::kDecayPeriodMs;
+    return periods >= failures ? 0 : (uint8_t)(failures - periods);
+}
+
+uint8_t Backoff::failuresFor(uint32_t peer, uint32_t nowMs) const
+{
+    for (const Slot &s : slots)
+        if (s.used && s.peer == peer)
+            return decayed(s.failures, s.last, nowMs);
+    return 0;
 }
 
 bool Backoff::isBlocked(uint32_t peer, uint32_t nowMs) const
@@ -166,6 +191,7 @@ void Backoff::recordFailure(uint32_t peer, uint32_t nowMs)
         victim->used = true;
         victim->peer = peer;
     }
+    victim->failures = decayed(victim->failures, victim->last, nowMs); // forgive failures after quiet time
     if (victim->failures < 255)
         victim->failures++;
     victim->last = nowMs;
@@ -221,6 +247,8 @@ bool SecretStore::copyTo(uint8_t out[kSecretLen]) const
 
 bool SecretStore::setSecret(const uint8_t s[kSecretLen])
 {
+    if (isWeakSecret(s))
+        return false;
 #ifdef FSCom
     if (persistToFlash) {
         concurrency::LockGuard g(spiLock);
@@ -241,6 +269,7 @@ bool SecretStore::setSecret(const uint8_t s[kSecretLen])
     memcpy(secret, s, kSecretLen);
     set = true;
     loaded = true;
+    gen++;
     return true;
 }
 
@@ -255,9 +284,18 @@ void SecretStore::clear()
     memset(secret, 0, sizeof(secret));
     set = false;
     loaded = true;
+    gen++;
 }
 
 // ----------------------------------------------------------------- helpers
+
+bool isWeakSecret(const uint8_t s[kSecretLen])
+{
+    uint8_t diff = 0;
+    for (size_t i = 1; i < kSecretLen; i++)
+        diff |= s[i] ^ s[0];
+    return diff == 0;
+}
 
 bool isProtectedPath(const char *path)
 {
@@ -332,3 +370,5 @@ Provisioner::Result Provisioner::feed(uint8_t c)
 }
 
 } // namespace tcpauth
+
+#endif // QWICKMESH_TCP_AUTH

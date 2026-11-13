@@ -1,9 +1,15 @@
 // Native tests for the QMA1 TCP API authentication core (src/mesh/api/TcpAuth.*).
 // Known-answer vectors are shared with tools/test_qwickmesh_tcp_auth.py (Python client).
+// The auth code is compiled only for QwickMesh envs; the test always enables it.
+#ifndef QWICKMESH_TCP_AUTH
+#define QWICKMESH_TCP_AUTH 1
+#endif
 #include "TestUtil.h"
 #include "mesh/api/TcpAuth.h"
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
+#include <new>
 #include <unity.h>
 
 using namespace tcpauth;
@@ -243,6 +249,134 @@ void test_const_time_eq()
     TEST_ASSERT_FALSE(constTimeEq(a, c, 4));
 }
 
+void test_revocation_clear_ends_session_and_handshake()
+{
+    SecretStore st(false);
+    TEST_ASSERT_TRUE(st.setSecret(S));
+    uint32_t sessionGen = st.generation();  // an authenticated session started here
+    uint32_t pendingGen = st.generation();  // and a handshake in flight
+    Handshake h;
+    uint8_t hello[kHelloLen];
+    uint8_t sec[32];
+    TEST_ASSERT_TRUE(st.copyTo(sec));
+    h.begin(sec, SN, 0, hello);
+    TEST_ASSERT_TRUE(st.isCurrent(sessionGen));
+    TEST_ASSERT_TRUE(st.isCurrent(pendingGen));
+    st.clear(); // QMAUTH CLEAR
+    TEST_ASSERT_FALSE(st.isCurrent(sessionGen));
+    TEST_ASSERT_FALSE(st.isCurrent(pendingGen));
+    // even re-provisioning the very same secret must not resurrect old sessions
+    TEST_ASSERT_TRUE(st.setSecret(S));
+    TEST_ASSERT_FALSE(st.isCurrent(sessionGen));
+    TEST_ASSERT_TRUE(st.isCurrent(st.generation()));
+}
+
+void test_revocation_set_rotates_generation()
+{
+    SecretStore st(false);
+    TEST_ASSERT_TRUE(st.setSecret(S));
+    uint32_t g = st.generation();
+    uint8_t other[32];
+    for (int i = 0; i < 32; i++)
+        other[i] = 0xA0 + i;
+    TEST_ASSERT_TRUE(st.setSecret(other)); // QMAUTH SET with a new key
+    TEST_ASSERT_FALSE(st.isCurrent(g));
+    TEST_ASSERT_TRUE(st.isCurrent(st.generation()));
+    // a failed (weak) SET changes nothing
+    uint32_t g2 = st.generation();
+    uint8_t zero[32] = {0};
+    TEST_ASSERT_FALSE(st.setSecret(zero));
+    TEST_ASSERT_EQUAL_UINT32(g2, st.generation());
+}
+
+void test_revocation_via_provisioner()
+{
+    SecretStore st(false);
+    Provisioner p(&st);
+    TEST_ASSERT_TRUE(st.setSecret(S));
+    uint32_t g = st.generation();
+    TEST_ASSERT_EQUAL(Provisioner::CLEARED, feedLine(p, "QMAUTH CLEAR"));
+    TEST_ASSERT_FALSE(st.isCurrent(g));
+    TEST_ASSERT_FALSE(st.isCurrent(st.generation())); // nothing is valid with no secret
+}
+
+void test_weak_secrets_rejected()
+{
+    SecretStore st(false);
+    Provisioner p(&st);
+    uint8_t w[32];
+    for (int v : {0x00, 0x01, 0xFF, 0xAB}) {
+        memset(w, v, sizeof(w));
+        TEST_ASSERT_TRUE(isWeakSecret(w));
+        TEST_ASSERT_FALSE(st.setSecret(w));
+    }
+    TEST_ASSERT_FALSE(st.isSet());
+    TEST_ASSERT_EQUAL(Provisioner::SET_BAD,
+                      feedLine(p, "QMAUTH SET 0000000000000000000000000000000000000000000000000000000000000000"));
+    TEST_ASSERT_EQUAL(Provisioner::SET_BAD,
+                      feedLine(p, "QMAUTH SET abababababababababababababababababababababababababababababababab"));
+    TEST_ASSERT_FALSE(st.isSet());
+    memset(w, 0, sizeof(w));
+    w[31] = 1; // a single differing byte is accepted
+    TEST_ASSERT_FALSE(isWeakSecret(w));
+    TEST_ASSERT_TRUE(st.setSecret(w));
+}
+
+void test_backoff_failures_decay()
+{
+    Backoff b;
+    const uint32_t A = 0x0A000009;
+    uint32_t t = 1000;
+    for (int i = 0; i < 6; i++) // 6 failures -> 8s block
+        b.recordFailure(A, t);
+    TEST_ASSERT_EQUAL_UINT8(6, b.failuresFor(A, t));
+    TEST_ASSERT_EQUAL_UINT32(8000, b.remainingMs(A, t));
+    // one failure forgiven per quiet kDecayPeriodMs
+    TEST_ASSERT_EQUAL_UINT8(5, b.failuresFor(A, t + Backoff::kDecayPeriodMs));
+    TEST_ASSERT_EQUAL_UINT8(0, b.failuresFor(A, t + 7 * Backoff::kDecayPeriodMs));
+    // a failure after a long quiet period starts from scratch (no block), not from the old count
+    b.recordFailure(A, t + 20 * Backoff::kDecayPeriodMs);
+    TEST_ASSERT_EQUAL_UINT8(1, b.failuresFor(A, t + 20 * Backoff::kDecayPeriodMs));
+    TEST_ASSERT_FALSE(b.isBlocked(A, t + 20 * Backoff::kDecayPeriodMs));
+    // a failure shortly after earlier ones still escalates
+    Backoff c;
+    for (int i = 0; i < 3; i++)
+        c.recordFailure(A, t);
+    c.recordFailure(A, t + 1500);
+    TEST_ASSERT_EQUAL_UINT8(4, c.failuresFor(A, t + 1500));
+}
+
+void test_handshake_wipes_secret_on_all_paths()
+{
+    // The object is inspected after teardown: placement-new + explicit destructor call.
+    alignas(Handshake) uint8_t raw[sizeof(Handshake)];
+    memset(raw, 0xEE, sizeof(raw));
+    Handshake *h = new (raw) Handshake();
+    uint8_t hello[kHelloLen], r[kResponseLen], bad[32];
+    memset(bad, 7, sizeof(bad));
+    h->begin(S, SN, 0, hello);
+    clientResponse(bad, SN, CN, r);
+    h->feed(r, kResponseLen); // FAILED path
+    auto contains = [&](const uint8_t *needle, size_t n) {
+        for (size_t i = 0; i + n <= sizeof(raw); i++)
+            if (memcmp(raw + i, needle, n) == 0)
+                return true;
+        return false;
+    };
+    TEST_ASSERT_FALSE(contains(S, 32));
+    // timeout path
+    h->begin(S, SN, 0, hello);
+    TEST_ASSERT_TRUE(contains(S, 32));
+    h->checkTimeout(kHandshakeTimeoutMs + 5);
+    TEST_ASSERT_FALSE(contains(S, 32));
+    // destroyed mid-handshake
+    h->begin(S, SN, 0, hello);
+    TEST_ASSERT_TRUE(contains(S, 32));
+    h->~Handshake();
+    TEST_ASSERT_FALSE(contains(S, 32));
+    TEST_ASSERT_FALSE(contains(SN, 16));
+}
+
 void setup()
 {
     delay(10);
@@ -263,6 +397,12 @@ void setup()
     RUN_TEST(test_provisioner_rejects_bad_input_and_keeps_old_secret);
     RUN_TEST(test_protected_paths);
     RUN_TEST(test_const_time_eq);
+    RUN_TEST(test_revocation_clear_ends_session_and_handshake);
+    RUN_TEST(test_revocation_set_rotates_generation);
+    RUN_TEST(test_revocation_via_provisioner);
+    RUN_TEST(test_weak_secrets_rejected);
+    RUN_TEST(test_backoff_failures_decay);
+    RUN_TEST(test_handshake_wipes_secret_on_all_paths);
     exit(UNITY_END());
 }
 

@@ -16,6 +16,9 @@
 #include <cstddef>
 #include <cstdint>
 
+// Everything here is QwickMesh-only (heltec-v4, heltec-v4-coex). Other targets compile none of it.
+#ifdef QWICKMESH_TCP_AUTH
+
 namespace tcpauth
 {
 
@@ -65,10 +68,17 @@ class Handshake
     /// Valid only when AUTHENTICATED: proof the server must send back (mutual authentication).
     const uint8_t *serverProofBytes() const { return proof; }
 
-    /// Wipe secret material.
+    /// Wipe secret material (secret + response). Called on every teardown path and from the destructor.
     void wipe();
 
+    ~Handshake()
+    {
+        wipe();
+        wipeAll();
+    }
+
   private:
+    void wipeAll();
     State state = FAILED;
     uint8_t secret[kSecretLen] = {0};
     uint8_t snonce[kNonceLen] = {0};
@@ -88,10 +98,14 @@ class Backoff
     static constexpr size_t kSlots = 8;
     static constexpr uint8_t kFreeFailures = 3;
     static constexpr uint32_t kMaxDelayMs = 5UL * 60UL * 1000UL;
+    /// One recorded failure is forgiven per this much quiet time (so rare typos over months never reach the cap).
+    static constexpr uint32_t kDecayPeriodMs = 10UL * 60UL * 1000UL;
 
     bool isBlocked(uint32_t peer, uint32_t nowMs) const;
     void recordFailure(uint32_t peer, uint32_t nowMs);
     void recordSuccess(uint32_t peer);
+    /// Failures currently held for the peer after decay (0 if unknown).
+    uint8_t failuresFor(uint32_t peer, uint32_t nowMs) const;
     /// Remaining block in ms (0 if not blocked).
     uint32_t remainingMs(uint32_t peer, uint32_t nowMs) const;
 
@@ -120,18 +134,27 @@ class SecretStore
     bool isSet() const { return set; }
     /// Copies the secret for the handshake only.
     bool copyTo(uint8_t out[kSecretLen]) const;
-    bool setSecret(const uint8_t s[kSecretLen]); // persists
-    void clear();                                 // persists (removes file)
+    /// Persists. Rejects weak secrets (all bytes equal, which includes all-zero) and returns false.
+    bool setSecret(const uint8_t s[kSecretLen]);
+    void clear(); // persists (removes file)
+    /// Bumped by every setSecret/clear. A session or handshake is only valid while the generation it started with is current.
+    uint32_t generation() const { return gen; }
+    /// True if a secret is set AND `startedGen` is still the current generation (i.e. the credential was not revoked/rotated).
+    bool isCurrent(uint32_t startedGen) const { return set && startedGen == gen; }
     static constexpr const char *kPath = "/prefs/tcp_auth.key";
 
   private:
     uint8_t secret[kSecretLen] = {0};
     bool set = false;
     bool loaded = false;
+    uint32_t gen = 0;
     bool persistToFlash;
 };
 
 SecretStore &store();
+
+/// True for secrets we refuse to store: every byte identical (all-zero, all-0xFF, ...).
+bool isWeakSecret(const uint8_t s[kSecretLen]);
 
 /// True if `path` (as typed by an API client, e.g. via XModem) refers to the secret file or tries to traverse.
 bool isProtectedPath(const char *path);
@@ -162,3 +185,5 @@ class Provisioner
 };
 
 } // namespace tcpauth
+
+#endif // QWICKMESH_TCP_AUTH
