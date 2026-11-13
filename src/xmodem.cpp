@@ -49,6 +49,9 @@
  **********************************************************************************************************************/
 
 #include "xmodem.h"
+#ifndef ARCH_STM32WL
+#include "mesh/api/TcpAuth.h"
+#endif
 #include "SPILock.h"
 
 #ifdef FSCom
@@ -166,6 +169,15 @@ bool XModemAdapter::handlePacket(meshtastic_XModem xmodemPacket, const PhoneAPI 
         if ((xmodemPacket.seq == 0) && !isReceiving && !isTransmitting) {
             // NULL packet has the destination filename
             memcpy(filename, &xmodemPacket.buffer.bytes, xmodemPacket.buffer.size);
+#ifndef ARCH_STM32WL
+            // Never let any API client read, overwrite or probe the TCP auth secret file
+            if (tcpauth::isProtectedPath(filename)) {
+                LOG_WARN("XModem: refusing protected path");
+                filename[0] = 0;
+                sendControl(meshtastic_XModem_Control_NAK);
+                break;
+            }
+#endif
 
             if (xmodemPacket.control == meshtastic_XModem_Control_SOH) { // Receive this file and put to Flash
                 spiLock->lock();

@@ -77,8 +77,10 @@ int32_t StreamAPI::handleRecStream(const char *buf, uint16_t bufLen)
         // console->printf("rxPtr %d ptr=%d c=0x%x\n", rxPtr, ptr, c);
 
         if (ptr == 0) { // looking for START1
-            if (c != START1)
-                rxPtr = 0;     // failed to find framing
+            if (c != START1) {
+                rxPtr = 0; // failed to find framing
+                onUnframedByte(c);
+            }
         } else if (ptr == 1) { // looking for START2
             if (c != START2)
                 rxPtr = 0;                             // failed to find framing
@@ -133,8 +135,10 @@ int32_t StreamAPI::readStream()
             // console->printf("rxPtr %d ptr=%d c=0x%x\n", rxPtr, ptr, c);
 
             if (ptr == 0) { // looking for START1
-                if (c != START1)
-                    rxPtr = 0;     // failed to find framing
+                if (c != START1) {
+                    rxPtr = 0; // failed to find framing
+                    onUnframedByte(c);
+                }
             } else if (ptr == 1) { // looking for START2
                 if (c != START2)
                     rxPtr = 0;                             // failed to find framing

@@ -35,6 +35,9 @@ void setBluetoothEnable(bool enable)
 {
 #if defined(USE_WS5500) || defined(USE_CH390D)
     if ((config.bluetooth.enabled == true) && (config.network.wifi_enabled == false))
+#elif HAS_WIFI && defined(QWICKMESH_BLE_WIFI_COEX)
+    // QwickMesh: Wi-Fi (authenticated TCP API) and BLE may run together on PSRAM boards. See DESIGN-wifi-auth.md.
+    if (config.bluetooth.enabled == true)
 #elif HAS_WIFI
     if (!isWifiAvailable() && config.bluetooth.enabled == true)
 #else
