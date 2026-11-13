@@ -77,6 +77,11 @@ class StreamAPI : public PhoneAPI
 
     virtual void onConnectionChanged(bool connected) override;
 
+#ifdef QWICKMESH_TCP_AUTH
+    /// Called for each received byte that is not part of a 0x94C3 frame (only the serial console overrides this).
+    virtual void onUnframedByte(uint8_t c) {}
+#endif
+
     /**
      * Send the current txBuffer over our stream
      */

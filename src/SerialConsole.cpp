@@ -148,3 +148,31 @@ void SerialConsole::log_to_serial(const char *logLevel, const char *format, va_l
     } else
         RedirectablePrint::log_to_serial(logLevel, format, arg);
 }
+#ifdef QWICKMESH_TCP_AUTH
+void SerialConsole::onUnframedByte(uint8_t c)
+{
+    using R = tcpauth::Provisioner::Result;
+    const char *msg = nullptr;
+    switch (provisioner.feed(c)) {
+    case R::SET_OK:
+        msg = "QMAUTH OK secret stored";
+        break;
+    case R::SET_BAD:
+        msg = "QMAUTH ERR need 64 hex chars (not all the same byte)";
+        break;
+    case R::CLEARED:
+        msg = "QMAUTH OK cleared, TCP API disabled";
+        break;
+    case R::STATUS_SET:
+        msg = "QMAUTH STATUS set";
+        break;
+    case R::STATUS_UNSET:
+        msg = "QMAUTH STATUS unset";
+        break;
+    default:
+        break;
+    }
+    if (msg)
+        consolePrintf("%s\r\n", msg);
+}
+#endif

@@ -2,6 +2,9 @@
 
 #include "RedirectablePrint.h"
 #include "StreamAPI.h"
+#ifdef QWICKMESH_TCP_AUTH
+#include "mesh/api/TcpAuth.h"
+#endif
 /**
  * Provides both debug printing and, if the client starts sending protobufs to us, switches to send/receive protobufs
  * (and starts dropping debug printing - FIXME, eventually those prints should be encapsulated in protobufs).
@@ -12,6 +15,9 @@ class SerialConsole : public StreamAPI, public RedirectablePrint, private concur
      * If true we are talking to a smart host and all messages (including log messages) must be framed as protobufs.
      */
     bool usingProtobufs = false;
+#ifdef QWICKMESH_TCP_AUTH
+    tcpauth::Provisioner provisioner;
+#endif
 
   public:
     SerialConsole();
@@ -39,6 +45,11 @@ class SerialConsole : public StreamAPI, public RedirectablePrint, private concur
     virtual bool checkIsConnected() override;
 
     virtual void onNowHasData(uint32_t fromRadioNum) override;
+
+#ifdef QWICKMESH_TCP_AUTH
+    /// Text provisioning of the TCP API secret ("QMAUTH SET/CLEAR/STATUS"). Serial/USB only; never echoes the secret.
+    virtual void onUnframedByte(uint8_t c) override;
+#endif
 
     /// Possibly switch to protobufs if we see a valid protobuf message
     virtual void log_to_serial(const char *logLevel, const char *format, va_list arg);
